@@ -1,0 +1,7 @@
+# 本地环境变量与构建产物
+.env
+/class-relay
+/bin/
+*.test
+*.out
+.DS_Store

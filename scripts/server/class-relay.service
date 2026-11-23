@@ -1,0 +1,17 @@
+# class-relay 用户级 systemd 单元（class-relay-ci 用户，linger 常驻）
+# 由 deployd sites.d/class-relay 安装到 ~/.config/systemd/user/class-relay.service
+[Unit]
+Description=class-relay - standalone classroom QR relay
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/class-relay
+Environment=ADDR=127.0.0.1:3003
+Environment=TRUST_PROXY=1
+Environment=GOMEMLIMIT=32MiB
+EnvironmentFile=-%h/.config/class-relay/env
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
