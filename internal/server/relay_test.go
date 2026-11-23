@@ -182,7 +182,7 @@ func TestHealthzRedirectsHeadersAndStatic(t *testing.T) {
 	if code != 200 || out["ok"] != true {
 		t.Fatalf("/healthz want 200 ok:true got %d %v", code, out)
 	}
-	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self';") || strings.Contains(csp, "wx.qq.com") || !strings.Contains(csp, "img-src 'self' data: blob:") || !strings.Contains(csp, "media-src 'self' blob:") {
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self' 'wasm-unsafe-eval';") || !strings.Contains(csp, "worker-src 'self';") || strings.Contains(csp, "wx.qq.com") || !strings.Contains(csp, "img-src 'self' data: blob:") || !strings.Contains(csp, "media-src 'self' blob:") {
 		t.Fatalf("unexpected CSP: %q", csp)
 	}
 	if pp := rec.Header().Get("Permissions-Policy"); pp != "camera=(self)" {
@@ -209,6 +209,31 @@ func TestHealthzRedirectsHeadersAndStatic(t *testing.T) {
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
 		t.Fatalf("GET / Cache-Control want no-cache got %q", cc)
+	}
+
+	// WASM 静态资源与长缓存
+	reqWasm := httptest.NewRequest("GET", "/vendor/zxing_reader.wasm", nil)
+	recWasm := httptest.NewRecorder()
+	e.h.ServeHTTP(recWasm, reqWasm)
+	if recWasm.Code != 200 {
+		t.Fatalf("GET /vendor/zxing_reader.wasm want 200 got %d", recWasm.Code)
+	}
+	if ct := recWasm.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/wasm") {
+		t.Fatalf("GET /vendor/zxing_reader.wasm Content-Type want prefix application/wasm got %q", ct)
+	}
+	if cc := recWasm.Header().Get("Cache-Control"); cc != "public, max-age=604800" {
+		t.Fatalf("GET /vendor/zxing_reader.wasm Cache-Control want public, max-age=604800 got %q", cc)
+	}
+
+	// Web Worker 脚本与 no-cache
+	reqWorker := httptest.NewRequest("GET", "/scanner-worker.js", nil)
+	recWorker := httptest.NewRecorder()
+	e.h.ServeHTTP(recWorker, reqWorker)
+	if recWorker.Code != 200 {
+		t.Fatalf("GET /scanner-worker.js want 200 got %d", recWorker.Code)
+	}
+	if cc := recWorker.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Fatalf("GET /scanner-worker.js Cache-Control want no-cache got %q", cc)
 	}
 
 	// clientIP with TrustProxy

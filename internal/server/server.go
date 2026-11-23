@@ -7,16 +7,22 @@ import (
 	"errors"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
 )
 
+func init() {
+	_ = mime.AddExtensionType(".wasm", "application/wasm")
+}
+
 //go:embed all:static
 var staticFS embed.FS
 
 const cspHeader = "default-src 'self'; " +
-	"script-src 'self'; " +
+	"script-src 'self' 'wasm-unsafe-eval'; " +
+	"worker-src 'self'; " +
 	"style-src 'self'; " +
 	"img-src 'self' data: blob:; " +
 	"connect-src 'self'; " +
@@ -79,7 +85,11 @@ func (s *Server) routes() {
 
 func noCache(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
+		if strings.HasPrefix(r.URL.Path, "/vendor/") {
+			w.Header().Set("Cache-Control", "public, max-age=604800")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

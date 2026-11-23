@@ -207,6 +207,7 @@ const state = {
   senderSource: loadSource(),
   senderTtl: loadTtl(),
   senderBusy: false,
+  senderProgress: '',
   senderError: '',
 };
 
@@ -465,7 +466,7 @@ function getScanCapability() {
   if (hasCamera) {
     return {
       ready: true,
-      label: 'Web 相机扫码就绪（支持微信内直接扫码与拍照识码）',
+      label: '高清远距扫码就绪（支持变焦与拍照识码）',
     };
   }
   return {
@@ -488,14 +489,22 @@ function openWebScanner() {
 
 async function handleImageFile(file) {
   state.senderBusy = true;
+  state.senderProgress = '正在读取原图…';
   state.senderError = '';
   render();
   try {
-    const text = await decodeImageFile(file);
+    const text = await decodeImageFile(file, {
+      onProgress: (label) => {
+        state.senderProgress = label;
+        render();
+      },
+    });
     state.senderBusy = false;
+    state.senderProgress = '';
     await handleScannedText(text);
   } catch (err) {
     state.senderBusy = false;
+    state.senderProgress = '';
     state.senderError = (err && err.message) || '图片识码失败';
     toast(state.senderError);
     render();
@@ -776,7 +785,7 @@ function renderSenderCard() {
         class: 'btn tonal wide-btn',
         disabled: state.senderBusy,
         onclick: () => fileInput.click(),
-      }, icon('image', 18), '拍照 / 相册识码')),
+      }, icon('image', 18), state.senderProgress || '拍照 / 相册识码')),
     renderActivePreview(),
     h('div', { class: 'sender-divider' }, '或手动粘贴链接'),
     pasteForm);
