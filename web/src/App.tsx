@@ -33,7 +33,7 @@ import { CameraScannerModal } from './components/CameraScannerModal';
 import { ToastHost, showToast } from './components/ToastHost';
 
 const NON_TAP_JUMP_SELECTOR =
-  'button, a, input, textarea, [role="switch"], .room-bar, .mode-switch, dialog';
+  'button, a, input, textarea, [role="switch"], .room-strip-wrap, .room-drawer-card, .prewarm-card, .mode-switch, dialog';
 
 export function App() {
   const [room, setRoom] = useState<string>(() => initialRoom());
@@ -322,6 +322,7 @@ export function App() {
           transport={transport.transport.value}
           rttMs={transport.rttMs.value}
           errorText={transport.errorText.value}
+          peers={transport.peers.value}
           redirectStatus={redirect.status.value}
           isTapJumpArmed={isTapJumpArmed}
           theme={themeMode.value}
@@ -333,7 +334,6 @@ export function App() {
 
         <RoomBar
           room={room}
-          peers={transport.peers.value}
           onChangeRoom={handleRoomChange}
         />
 
@@ -342,8 +342,6 @@ export function App() {
             item={activeItem}
             nowMs={nowMs.value}
             peers={transport.peers.value}
-            status={transport.status.value}
-            transport={transport.transport.value}
             autoRedirect={autoRedirect}
             redirect={redirect}
             onToggleAutoRedirect={handleToggleAutoRedirect}
@@ -387,7 +385,7 @@ export function App() {
         ) : null}
 
         <aside class="relay-footer-note">
-          仅在房间内临时转发扫码链接，服务端仅内存暂存并在过期后自动清除。
+          纯内存临时转发 · 过期自动清除
         </aside>
       </main>
 

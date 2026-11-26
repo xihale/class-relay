@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type {
   DecodeProgress,
   RelayItem,
@@ -61,26 +61,21 @@ export function SenderView({
   fileInputRef,
 }: SenderViewProps) {
   const [decodeProgress, setDecodeProgress] = useState<DecodeProgress | null>(null);
+  const [manualOpen, setManualOpen] = useState(() => Boolean(url.trim() || error));
   const decodeAbortRef = useRef<AbortController | null>(null);
 
-  const scanCap = useMemo(() => {
-    try {
-      const support = getScannerSupport();
-      if (support.camera) {
-        return {
-          ready: true,
-          label: support.barcodeDetector
-            ? '高清远距扫码就绪（原生加速 + 变焦）'
-            : '高清远距扫码就绪（支持变焦与拍照识码）',
-        };
-      }
-    } catch {
-      // fallback
+  useEffect(() => {
+    if (error || url.trim()) {
+      setManualOpen(true);
     }
-    return {
-      ready: false,
-      label: '当前环境不支持实时相机（需 HTTPS），请使用「相册 / 截图识码」',
-    };
+  }, [error, url]);
+
+  const cameraReady = useMemo(() => {
+    try {
+      return getScannerSupport().camera;
+    } catch {
+      return false;
+    }
   }, []);
 
   const isDecoding = decodeProgress !== null;
@@ -91,7 +86,8 @@ export function SenderView({
     const extracted = extractUrl(text);
     if (!extracted) {
       onUrlChange(text);
-      onErrorChange('二维码内容不包含 http(s):// 链接，已填入下方文本框供核对');
+      onErrorChange('二维码内容不包含 http(s):// 链接，已填入下方供核对');
+      setManualOpen(true);
       showToast('未识别到网址，请检查二维码内容');
       return;
     }
@@ -193,29 +189,25 @@ export function SenderView({
 
   return (
     <section class="card relay-card" aria-label="教室发码扫码端">
-      <div class="sender-status-row">
-        <span class="scan-badge ready" aria-live="polite">
+      <div class="sender-quiet-meta" aria-live="polite">
+        <span class="sender-quiet-peers">
           <span
             class={peers.recv > 0 ? 'relay-dot live' : 'relay-dot'}
             aria-hidden="true"
           />
-          <span>当前 {peers.recv} 名同学在线等码</span>
-        </span>
-
-        {activeItem ? (
-          <span class="scan-badge receipts" aria-live="polite">
-            <Icon name="check" size={14} />
-            <span>
-              已送达 {receipts.delivered} · 已跳转 {receipts.jumped}
-            </span>
+          <span>
+            {peers.recv > 0
+              ? `${peers.recv} 位同学等待收码`
+              : '暂无同学等待，可先分享房间链接'}
           </span>
-        ) : null}
+        </span>
       </div>
 
-      <div class={scanCap.ready ? 'scan-badge ready' : 'scan-badge warn'}>
-        <span class={scanCap.ready ? 'relay-dot live' : 'relay-dot'} aria-hidden="true" />
-        <span>{scanCap.label}</span>
-      </div>
+      {!cameraReady ? (
+        <div class="sender-cap-warn">
+          当前环境不支持实时相机（需 HTTPS），可使用「相册 / 截图识码」。
+        </div>
+      ) : null}
 
       <input
         ref={fileInputRef}
@@ -237,8 +229,8 @@ export function SenderView({
           disabled={isBusy}
           onClick={onOpenCamera}
         >
-          <Icon name="scan" size={22} />
-          <span>扫一扫并发送</span>
+          <Icon name="scan" size={20} />
+          <span>扫一扫发码</span>
         </button>
 
         <button
@@ -247,7 +239,7 @@ export function SenderView({
           disabled={isBusy}
           onClick={() => fileInputRef.current?.click()}
         >
-          <Icon name="image" size={18} />
+          <Icon name="image" size={17} />
           <span>{isDecoding ? decodeProgress.label : '相册 / 截图识码'}</span>
         </button>
       </div>
@@ -271,7 +263,7 @@ export function SenderView({
       ) : null}
 
       {activeItem ? (
-        <div class="sender-preview">
+        <div class="sender-preview-card">
           <div class="relay-active-head">
             <div class="relay-badges">
               <span class="relay-pill">{activeItem.source}</span>
@@ -279,109 +271,131 @@ export function SenderView({
                 id="relay-ttl"
                 class={remain <= 15 ? 'relay-pill ttl urgent' : 'relay-pill ttl'}
               >
-                {remain}s 后过期
+                {remain}s
+              </span>
+              <span class="sender-receipts" aria-live="polite">
+                已送达 {receipts.delivered} · 已跳转 {receipts.jumped}
               </span>
             </div>
             <button
               type="button"
-              class="btn small danger-ghost"
+              class="btn text"
               onClick={() => void onClear()}
             >
-              清除
+              撤回
             </button>
           </div>
           <div class="stack-sm">
             <b>{activeItem.host || '当前房间有效链接'}</b>
-            <p class="relay-url">{activeItem.url}</p>
+            <p class="relay-url" title={activeItem.url}>{activeItem.url}</p>
           </div>
         </div>
       ) : null}
 
-      <div class="sender-divider">或手动粘贴链接</div>
+      <div class={manualOpen ? 'disclosure-wrap expanded' : 'disclosure-wrap'}>
+        <button
+          type="button"
+          class="disclosure-toggle"
+          aria-expanded={manualOpen}
+          aria-controls="sender-manual-panel"
+          onClick={() => setManualOpen((v) => !v)}
+        >
+          <span>手动粘贴链接 · {source} · {ttl}s</span>
+          <Icon name="down" size={16} class="disclosure-toggle-icon" />
+        </button>
 
-      <form class="sender-form" onSubmit={handleSubmit}>
-        <div class="field">
-          <div class="field-head">
-            <label class="field-label" for="sender-url-input">
-              粘贴链接发送
-            </label>
-            <button
-              type="button"
-              class="btn small ghost"
-              onClick={() => void handlePasteOrExtract()}
-            >
-              粘贴 / 提取
+        <form
+          id="sender-manual-panel"
+          class="sender-form"
+          hidden={!manualOpen}
+          onSubmit={handleSubmit}
+        >
+          <div class="field">
+            <div class="field-head">
+              <label class="field-label" for="sender-url-input">
+                签到链接
+              </label>
+              <button
+                type="button"
+                class="btn text"
+                onClick={() => void handlePasteOrExtract()}
+              >
+                粘贴 / 提取
+              </button>
+            </div>
+            <textarea
+              id="sender-url-input"
+              class="input relay-tonal-input"
+              value={url}
+              placeholder="粘贴包含 http(s):// 的签到链接或文本"
+              aria-describedby={error ? 'sender-url-error' : undefined}
+              onInput={(e) => {
+                onUrlChange((e.currentTarget as HTMLTextAreaElement).value);
+                if (error) onErrorChange('');
+              }}
+            />
+          </div>
+
+          <div class="sender-form-grid">
+            <div class="field">
+              <span class="field-label">平台</span>
+              <div class="seg" role="group" aria-label="来源平台">
+                {SOURCES.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    class="seg-btn"
+                    aria-pressed={source === s}
+                    onClick={() => onSourceChange(s)}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div class="field">
+              <span class="field-label">时长</span>
+              <div class="seg" role="group" aria-label="有效时长">
+                {TTLS.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    class="seg-btn"
+                    aria-pressed={ttl === t}
+                    onClick={() => onTtlChange(t)}
+                  >
+                    {t}s
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {error ? (
+            <p id="sender-url-error" class="form-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+
+          <div class="sender-form-actions">
+            <button type="submit" class="btn primary" disabled={isBusy}>
+              <Icon name="send" size={16} />
+              <span>{busy ? '发送中…' : '推送到房间'}</span>
             </button>
-          </div>
-          <textarea
-            id="sender-url-input"
-            class="input relay-tonal-input"
-            value={url}
-            placeholder="粘贴包含 http(s):// 的签到链接或文本"
-            aria-describedby={error ? 'sender-url-error' : undefined}
-            onInput={(e) => {
-              onUrlChange((e.currentTarget as HTMLTextAreaElement).value);
-              if (error) onErrorChange('');
-            }}
-          />
-        </div>
-
-        <div class="field">
-          <span class="field-label">签到平台</span>
-          <div class="seg" role="group" aria-label="来源平台">
-            {SOURCES.map((s) => (
+            {activeItem ? (
               <button
-                key={s}
                 type="button"
-                class="seg-btn"
-                aria-pressed={source === s}
-                onClick={() => onSourceChange(s)}
+                class="btn danger-ghost"
+                disabled={isBusy}
+                onClick={() => void onClear()}
               >
-                {s}
+                清除
               </button>
-            ))}
+            ) : null}
           </div>
-        </div>
-
-        <div class="field">
-          <span class="field-label">有效时长</span>
-          <div class="seg" role="group" aria-label="有效时长">
-            {TTLS.map((t) => (
-              <button
-                key={t}
-                type="button"
-                class="seg-btn"
-                aria-pressed={ttl === t}
-                onClick={() => onTtlChange(t)}
-              >
-                {t} 秒
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {error ? (
-          <p id="sender-url-error" class="form-error" role="alert">
-            {error}
-          </p>
-        ) : null}
-
-        <div class="sender-form-actions">
-          <button type="submit" class="btn primary" disabled={isBusy}>
-            <Icon name="send" size={18} />
-            <span>{busy ? '发送中…' : '推送到房间'}</span>
-          </button>
-          <button
-            type="button"
-            class="btn danger-ghost"
-            disabled={!activeItem || isBusy}
-            onClick={() => void onClear()}
-          >
-            <Icon name="trash" size={18} />
-            <span>清除</span>
-          </button>
-        </div>
-      </form>
+        </form>
+      </div>
     </section>
   );
 }

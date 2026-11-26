@@ -3,8 +3,8 @@ import { computed, signal, type ReadonlySignal } from '@preact/signals';
 export type ThemeMode = 'system' | 'light' | 'dark';
 
 const STORAGE_THEME = 'class-relay-theme';
-const BG_LIGHT = '#F2F7F5';
-const BG_DARK = '#141A19';
+const BG_LIGHT = '#F6F8FB';
+const BG_DARK = '#0B1017';
 
 function readSavedTheme(): ThemeMode {
   try {

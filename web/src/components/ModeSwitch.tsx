@@ -14,7 +14,7 @@ export function ModeSwitch({ mode, onChange }: ModeSwitchProps) {
         aria-pressed={mode === 'recv'}
         onClick={() => onChange('recv')}
       >
-        收码自动跳
+        收码等待
       </button>
       <button
         type="button"
@@ -22,7 +22,7 @@ export function ModeSwitch({ mode, onChange }: ModeSwitchProps) {
         aria-pressed={mode === 'send'}
         onClick={() => onChange('send')}
       >
-        发码扫码端
+        教室发码
       </button>
     </div>
   );

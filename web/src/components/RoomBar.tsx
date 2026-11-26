@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'preact/hooks';
-import type { RoomPeers } from '../types/protocol';
 import {
   VALID_ROOM_RE,
   buildShareUrl,
@@ -11,11 +10,10 @@ import { showToast } from './ToastHost';
 
 export interface RoomBarProps {
   room: string;
-  peers: RoomPeers;
   onChangeRoom: (nextRoom: string) => void;
 }
 
-export function RoomBar({ room, peers, onChangeRoom }: RoomBarProps) {
+export function RoomBar({ room, onChangeRoom }: RoomBarProps) {
   const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState(room);
 
@@ -39,46 +37,35 @@ export function RoomBar({ room, peers, onChangeRoom }: RoomBarProps) {
     showToast(ok ? okText : '复制失败，请手动复制地址栏');
   };
 
-  const onlineCount = Math.max(0, peers.total);
-
   return (
     <section
-      class={expanded ? 'card room-bar expanded' : 'card room-bar'}
-      aria-label="房间设置与分享"
+      class={expanded ? 'room-strip-wrap expanded' : 'room-strip-wrap'}
+      aria-label="房间切换与分享"
     >
-      <div class="room-summary">
-        <div class="room-summary-main">
-          <span class="room-label">房间</span>
+      <div class="room-strip">
+        <button
+          type="button"
+          class="room-pill-btn"
+          aria-expanded={expanded}
+          aria-controls="room-drawer"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <span class="room-hash" aria-hidden="true">#</span>
           <span class="room-code">{room}</span>
-          <span class="room-peers-pill" aria-live="polite">
-            <span class={onlineCount > 0 ? 'relay-dot live' : 'relay-dot'} aria-hidden="true" />
-            <span>{onlineCount} 人在线</span>
-          </span>
-        </div>
+          <Icon name="down" size={14} class="room-toggle-icon" />
+        </button>
 
-        <div class="room-summary-actions">
-          <button
-            type="button"
-            class="btn small tonal"
-            onClick={() => handleCopy('recv', '已复制室友收码链接')}
-          >
-            <Icon name="copy" size={15} />
-            <span>复制链接</span>
-          </button>
-          <button
-            type="button"
-            class="icon-btn"
-            aria-label={expanded ? '收起房间设置' : '展开房间设置'}
-            aria-expanded={expanded}
-            aria-controls="room-drawer"
-            onClick={() => setExpanded((v) => !v)}
-          >
-            <Icon name="down" size={18} class="room-toggle-icon" />
-          </button>
-        </div>
+        <button
+          type="button"
+          class="btn text"
+          onClick={() => handleCopy('recv', '已复制房间分享链接')}
+        >
+          <Icon name="copy" size={14} />
+          <span>分享链接</span>
+        </button>
       </div>
 
-      <div id="room-drawer" class="room-drawer" hidden={!expanded}>
+      <div id="room-drawer" class="card room-drawer-card" hidden={!expanded}>
         <form class="room-form" onSubmit={handleSubmit}>
           <label class="sr-only" for="room-id-input">房间号</label>
           <input
@@ -103,7 +90,7 @@ export function RoomBar({ room, peers, onChangeRoom }: RoomBarProps) {
               onChangeRoom(next);
             }}
           >
-            <Icon name="shuffle" size={18} />
+            <Icon name="shuffle" size={17} />
           </button>
           <button type="submit" class="btn small primary">进入</button>
         </form>
@@ -114,7 +101,7 @@ export function RoomBar({ room, peers, onChangeRoom }: RoomBarProps) {
             class="btn small"
             onClick={() => handleCopy('recv', '已复制室友收码链接')}
           >
-            <Icon name="copy" size={16} />
+            <Icon name="copy" size={14} />
             <span>复制收码链接</span>
           </button>
           <button
@@ -122,7 +109,7 @@ export function RoomBar({ room, peers, onChangeRoom }: RoomBarProps) {
             class="btn small"
             onClick={() => handleCopy('send', '已复制教室发码链接')}
           >
-            <Icon name="link" size={16} />
+            <Icon name="link" size={14} />
             <span>复制发码链接</span>
           </button>
         </div>

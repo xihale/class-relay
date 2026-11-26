@@ -1,4 +1,9 @@
-import type { ConnectionStatus, RedirectStatus, TransportKind } from '../types/protocol';
+import type {
+  ConnectionStatus,
+  RedirectStatus,
+  RoomPeers,
+  TransportKind,
+} from '../types/protocol';
 import type { ThemeMode } from '../lib/theme';
 
 const ICONS = {
@@ -60,6 +65,7 @@ export interface TopBarProps {
   transport: TransportKind;
   rttMs: number | null;
   errorText: string;
+  peers: RoomPeers;
   redirectStatus: RedirectStatus;
   isTapJumpArmed: boolean;
   theme: ThemeMode;
@@ -69,30 +75,37 @@ export interface TopBarProps {
 
 function getChipState(props: TopBarProps): {
   label: string;
+  title: string;
   dotClass: string;
   chipClass: string;
   interactive: boolean;
 } {
+  const protoLabel =
+    props.transport === 'ws'
+      ? props.rttMs !== null
+        ? `WS · ${Math.round(props.rttMs)}ms`
+        : 'WS'
+      : props.transport === 'sse'
+        ? 'SSE'
+        : '长轮询';
+
   if (props.isTapJumpArmed) {
-    if (props.redirectStatus === 'blocked') {
-      return {
-        label: '待轻触跳转',
-        dotClass: 'relay-dot err',
-        chipClass: 'sync-chip interactive err-chip',
-        interactive: true,
-      };
-    }
     return {
-      label: '待轻触跳转',
-      dotClass: 'relay-dot warn',
-      chipClass: 'sync-chip interactive warn-chip',
+      label: '点此跳转',
+      title: '轻触即可跳转签到页',
+      dotClass: props.redirectStatus === 'blocked' ? 'relay-dot err' : 'relay-dot warn',
+      chipClass:
+        props.redirectStatus === 'blocked'
+          ? 'sync-chip interactive err-chip'
+          : 'sync-chip interactive warn-chip',
       interactive: true,
     };
   }
 
   if (props.status === 'offline') {
     return {
-      label: '网络已断开 · 点此重连',
+      label: '已断开 · 重连',
+      title: '网络已断开，点击尝试重连',
       dotClass: 'relay-dot err',
       chipClass: 'sync-chip interactive err-chip',
       interactive: true,
@@ -101,7 +114,8 @@ function getChipState(props: TopBarProps): {
 
   if (props.status === 'error') {
     return {
-      label: props.errorText || '连接异常 · 点此重连',
+      label: '连接异常 · 重连',
+      title: props.errorText || '连接异常，点击重连',
       dotClass: 'relay-dot err',
       chipClass: 'sync-chip interactive err-chip',
       interactive: true,
@@ -110,7 +124,8 @@ function getChipState(props: TopBarProps): {
 
   if (props.status === 'reconnecting') {
     return {
-      label: '重连中…',
+      label: '重连中',
+      title: '正在重新建立实时连接',
       dotClass: 'relay-dot warn',
       chipClass: 'sync-chip',
       interactive: false,
@@ -119,35 +134,19 @@ function getChipState(props: TopBarProps): {
 
   if (props.status === 'connecting') {
     return {
-      label: '连接中…',
+      label: '连接中',
+      title: '正在连接房间通道',
       dotClass: 'relay-dot',
       chipClass: 'sync-chip',
       interactive: false,
     };
   }
 
-  if (props.transport === 'ws') {
-    const label = props.rttMs !== null ? `WS · ${Math.round(props.rttMs)}ms` : 'WS';
-    return {
-      label,
-      dotClass: 'relay-dot live',
-      chipClass: 'sync-chip',
-      interactive: false,
-    };
-  }
-
-  if (props.transport === 'sse') {
-    return {
-      label: 'SSE',
-      dotClass: 'relay-dot live',
-      chipClass: 'sync-chip',
-      interactive: false,
-    };
-  }
-
+  const online = Math.max(0, props.peers.total);
   return {
-    label: '长轮询',
-    dotClass: 'relay-dot active',
+    label: `${online} 人在线`,
+    title: `${protoLabel} 实时已连接`,
+    dotClass: props.transport === 'poll' ? 'relay-dot active' : 'relay-dot live',
     chipClass: 'sync-chip',
     interactive: false,
   };
@@ -170,13 +169,10 @@ export function TopBar(props: TopBarProps) {
           class="relay-logo"
           src="/icon.svg"
           alt="课堂接力"
-          width={36}
-          height={36}
+          width={28}
+          height={28}
         />
-        <div class="relay-title-col">
-          <h1>课堂接力</h1>
-          <span class="relay-subtitle">Class Relay · 实时接力</span>
-        </div>
+        <h1>课堂接力</h1>
       </div>
 
       <div class="topbar-actions">
@@ -184,6 +180,7 @@ export function TopBar(props: TopBarProps) {
           type="button"
           id="relay-status-chip"
           class={chip.chipClass}
+          title={chip.title}
           disabled={!chip.interactive}
           aria-live="polite"
           onClick={chip.interactive ? props.onStatusAction : undefined}
@@ -199,7 +196,7 @@ export function TopBar(props: TopBarProps) {
           title={tm.label}
           onClick={props.onCycleTheme}
         >
-          <Icon name={tm.icon} size={18} />
+          <Icon name={tm.icon} size={17} />
         </button>
       </div>
     </header>
