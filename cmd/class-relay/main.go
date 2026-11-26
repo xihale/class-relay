@@ -44,7 +44,7 @@ func main() {
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      40 * time.Second,
+		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -65,4 +65,5 @@ func main() {
 	if err := hs.Shutdown(ctx); err != nil {
 		log.Printf("关闭服务出错：%v", err)
 	}
+	srv.Close()
 }

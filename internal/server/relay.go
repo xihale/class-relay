@@ -7,17 +7,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	relayDefaultTTL = 90 * time.Second
-	relayMinTTL     = 15 * time.Second
-	relayMaxTTL     = 300 * time.Second
-	relayRoomMaxAge = 24 * time.Hour
-	relayMaxRooms   = 512
-	relayMaxWait    = 20 * time.Second
-	relayMaxURLLen  = 2048
+	relayDefaultTTL        = 90 * time.Second
+	relayMinTTL            = 15 * time.Second
+	relayMaxTTL            = 300 * time.Second
+	relayRoomMaxAge        = 24 * time.Hour
+	relayMaxRooms          = 512
+	relayMaxWait           = 20 * time.Second
+	relayMaxURLLen         = 2048
+	relayMaxWaitersPerRoom = 256
+	relayMaxWaitersTotal   = 4096
+	relayJanitorInterval   = 5 * time.Minute
 )
 
 var relayRoomRe = regexp.MustCompile(`^[A-Za-z0-9_-]{3,32}$`)
@@ -41,12 +45,73 @@ type relayRoom struct {
 }
 
 type relayHub struct {
-	mu    sync.Mutex
-	rooms map[string]*relayRoom
+	mu        sync.Mutex
+	rooms     map[string]*relayRoom
+	waiters   atomic.Int64
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
 func newRelayHub() *relayHub {
-	return &relayHub{rooms: make(map[string]*relayRoom)}
+	return newRelayHubWithJanitor(relayJanitorInterval)
+}
+
+func newRelayHubWithJanitor(interval time.Duration) *relayHub {
+	h := &relayHub{
+		rooms:  make(map[string]*relayRoom),
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	if interval > 0 {
+		go h.janitor(interval)
+	} else {
+		close(h.doneCh)
+	}
+	return h
+}
+
+func (h *relayHub) janitor(interval time.Duration) {
+	defer close(h.doneCh)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			h.sweep(time.Now())
+		case <-h.stopCh:
+			return
+		}
+	}
+}
+
+func (h *relayHub) Close() {
+	h.closeOnce.Do(func() {
+		close(h.stopCh)
+		<-h.doneCh
+	})
+}
+
+func (h *relayHub) sweep(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, rm := range h.rooms {
+		rm.mu.Lock()
+		expired := rm.item != nil && !rm.item.ExpiresAt.After(now)
+		if expired {
+			rm.item = nil
+		}
+		remove := (expired && now.Sub(rm.updated) > 5*time.Minute) || now.Sub(rm.updated) > relayRoomMaxAge
+		if remove {
+			if len(rm.waiters) > 0 {
+				rm.notifyLocked()
+			}
+			rm.mu.Unlock()
+			delete(h.rooms, id)
+			continue
+		}
+		rm.mu.Unlock()
+	}
 }
 
 func (h *relayHub) getRoom(id string, create bool) *relayRoom {
@@ -61,6 +126,9 @@ func (h *relayHub) getRoom(id string, create bool) *relayRoom {
 	if len(h.rooms) >= relayMaxRooms {
 		h.evictLocked(time.Now())
 	}
+	if len(h.rooms) >= relayMaxRooms {
+		return nil
+	}
 	rm := &relayRoom{
 		updated: time.Now(),
 		waiters: make(map[chan struct{}]struct{}),
@@ -69,7 +137,7 @@ func (h *relayHub) getRoom(id string, create bool) *relayRoom {
 	return rm
 }
 
-// evictLocked removes expired or oldest rooms when the hub reaches capacity.
+// evictLocked removes expired or oldest idle rooms when the hub reaches capacity.
 func (h *relayHub) evictLocked(now time.Time) {
 	var oldestID string
 	var oldestTime time.Time
@@ -77,13 +145,18 @@ func (h *relayHub) evictLocked(now time.Time) {
 		rm.mu.Lock()
 		expired := rm.item != nil && !rm.item.ExpiresAt.After(now) && now.Sub(rm.updated) > 5*time.Minute
 		stale := now.Sub(rm.updated) > relayRoomMaxAge
+		hasWaiters := len(rm.waiters) > 0
 		upd := rm.updated
-		rm.mu.Unlock()
 		if expired || stale {
+			if hasWaiters {
+				rm.notifyLocked()
+			}
+			rm.mu.Unlock()
 			delete(h.rooms, id)
 			continue
 		}
-		if oldestID == "" || upd.Before(oldestTime) {
+		rm.mu.Unlock()
+		if !hasWaiters && (oldestID == "" || upd.Before(oldestTime)) {
 			oldestID = id
 			oldestTime = upd
 		}
@@ -164,6 +237,10 @@ func (s *Server) handleRelayPush(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	rm := s.relay.getRoom(roomID, true)
+	if rm == nil {
+		writeErr(w, http.StatusTooManyRequests, "too_many_rooms", "房间数量已达上限，请稍后再试")
+		return
+	}
 	rm.mu.Lock()
 	rm.seq++
 	item := &relayItem{
@@ -217,8 +294,16 @@ func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if waitDur > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(waitDur + 10*time.Second))
+	}
+
 	rm := s.relay.getRoom(roomID, waitDur > 0)
 	if rm == nil {
+		if waitDur > 0 {
+			writeErr(w, http.StatusTooManyRequests, "too_many_rooms", "房间数量已达上限，请稍后再试")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"room":       roomID,
 			"seq":        0,
@@ -231,8 +316,21 @@ func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
 	rm.mu.Lock()
 	now := time.Now()
 	cur := rm.activeItemLocked(now)
-	hasNewer := cur != nil && cur.Seq > since
+	hasNewer := (cur != nil && cur.Seq > since) || (cur == nil && since > 0 && rm.seq > since)
 	if !hasNewer && waitDur > 0 {
+		if len(rm.waiters) >= relayMaxWaitersPerRoom {
+			rm.mu.Unlock()
+			writeErr(w, http.StatusTooManyRequests, "too_many_waiters", "当前房间等待连接数已达上限，请稍后再试")
+			return
+		}
+		if s.relay.waiters.Add(1) > relayMaxWaitersTotal {
+			s.relay.waiters.Add(-1)
+			rm.mu.Unlock()
+			writeErr(w, http.StatusTooManyRequests, "too_many_waiters", "服务等待连接数已达上限，请稍后再试")
+			return
+		}
+		defer s.relay.waiters.Add(-1)
+
 		ch := make(chan struct{})
 		rm.waiters[ch] = struct{}{}
 		rm.mu.Unlock()

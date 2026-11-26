@@ -2,12 +2,16 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,6 +25,7 @@ type testEnv struct {
 func newTestEnv(t *testing.T, opt Options) *testEnv {
 	t.Helper()
 	s := New(opt)
+	t.Cleanup(s.Close)
 	return &testEnv{t: t, s: s, h: s.Handler()}
 }
 
@@ -150,6 +155,7 @@ func TestRelayLongPollWakesOnPush(t *testing.T) {
 
 func TestRelayHubEviction(t *testing.T) {
 	hub := newRelayHub()
+	defer hub.Close()
 	base := time.Now().Add(-2 * time.Hour)
 	for i := 0; i < relayMaxRooms; i++ {
 		id := fmt.Sprintf("room_%03d", i)
@@ -248,5 +254,245 @@ func TestHealthzRedirectsHeadersAndStatic(t *testing.T) {
 	r2.Header.Set("X-Real-IP", "198.51.100.7")
 	if got := e.s.clientIP(r2); got != "198.51.100.7" {
 		t.Fatalf("clientIP X-Real-IP want 198.51.100.7 got %q", got)
+	}
+}
+
+func TestRelayPollImmediateAfterDelete(t *testing.T) {
+	e := newTestEnv(t, Options{})
+
+	code, out, _ := e.do("POST", "/api/v1/relay/clearroom", map[string]any{
+		"url": "https://example.com/a",
+	})
+	if code != 200 || int64(out["seq"].(float64)) != 1 {
+		t.Fatalf("push failed: %d %v", code, out)
+	}
+
+	code, out, _ = e.do("DELETE", "/api/v1/relay/clearroom", nil)
+	if code != 200 || int64(out["seq"].(float64)) != 2 {
+		t.Fatalf("delete failed: %d %v", code, out)
+	}
+
+	// Client with since=1 polling with wait=5 must return immediately with seq=2, active=false.
+	start := time.Now()
+	code, out, _ = e.do("GET", "/api/v1/relay/clearroom?since=1&wait=5", nil)
+	elapsed := time.Since(start)
+	if code != 200 || out["active"] != false || int64(out["seq"].(float64)) != 2 {
+		t.Fatalf("unexpected poll response: %d %v", code, out)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("poll blocked %v instead of returning immediately after DELETE", elapsed)
+	}
+}
+
+func TestStaticGzipAndETag304(t *testing.T) {
+	e := newTestEnv(t, Options{})
+
+	for _, tc := range []struct {
+		path string
+		ct   string
+		cc   string
+	}{
+		{"/vendor/zxing_reader.wasm", "application/wasm", "public, max-age=604800"},
+		{"/scanner-worker.js", "text/javascript", "no-cache"},
+	} {
+		// Uncompressed request
+		reqRaw := httptest.NewRequest("GET", tc.path, nil)
+		recRaw := httptest.NewRecorder()
+		e.h.ServeHTTP(recRaw, reqRaw)
+		if recRaw.Code != 200 {
+			t.Fatalf("%s raw want 200 got %d", tc.path, recRaw.Code)
+		}
+		if ct := recRaw.Header().Get("Content-Type"); !strings.HasPrefix(ct, tc.ct) {
+			t.Fatalf("%s Content-Type want prefix %q got %q", tc.path, tc.ct, ct)
+		}
+		if cc := recRaw.Header().Get("Cache-Control"); cc != tc.cc {
+			t.Fatalf("%s Cache-Control want %q got %q", tc.path, tc.cc, cc)
+		}
+		rawETag := recRaw.Header().Get("ETag")
+		if rawETag == "" || strings.HasSuffix(rawETag, `-gz"`) {
+			t.Fatalf("%s unexpected raw ETag %q", tc.path, rawETag)
+		}
+		if vary := recRaw.Header().Get("Vary"); vary != "Accept-Encoding" {
+			t.Fatalf("%s Vary want Accept-Encoding got %q", tc.path, vary)
+		}
+
+		// Gzipped request
+		reqGz := httptest.NewRequest("GET", tc.path, nil)
+		reqGz.Header.Set("Accept-Encoding", "br, gzip")
+		recGz := httptest.NewRecorder()
+		e.h.ServeHTTP(recGz, reqGz)
+		if recGz.Code != 200 {
+			t.Fatalf("%s gz want 200 got %d", tc.path, recGz.Code)
+		}
+		if ce := recGz.Header().Get("Content-Encoding"); ce != "gzip" {
+			t.Fatalf("%s Content-Encoding want gzip got %q", tc.path, ce)
+		}
+		gzETag := recGz.Header().Get("ETag")
+		if !strings.HasSuffix(gzETag, `-gz"`) || gzETag == rawETag {
+			t.Fatalf("%s unexpected gz ETag %q", tc.path, gzETag)
+		}
+		gr, err := gzip.NewReader(bytes.NewReader(recGz.Body.Bytes()))
+		if err != nil {
+			t.Fatalf("%s gzip reader: %v", tc.path, err)
+		}
+		decompressed, err := io.ReadAll(gr)
+		_ = gr.Close()
+		if err != nil {
+			t.Fatalf("%s gzip read: %v", tc.path, err)
+		}
+		if !bytes.Equal(decompressed, recRaw.Body.Bytes()) {
+			t.Fatalf("%s decompressed body mismatch", tc.path)
+		}
+
+		// 304 Not Modified for gzip ETag
+		req304Gz := httptest.NewRequest("GET", tc.path, nil)
+		req304Gz.Header.Set("Accept-Encoding", "gzip")
+		req304Gz.Header.Set("If-None-Match", gzETag)
+		rec304Gz := httptest.NewRecorder()
+		e.h.ServeHTTP(rec304Gz, req304Gz)
+		if rec304Gz.Code != http.StatusNotModified || rec304Gz.Body.Len() != 0 {
+			t.Fatalf("%s 304 gz want 304 empty got %d len=%d", tc.path, rec304Gz.Code, rec304Gz.Body.Len())
+		}
+
+		// Encoding-aware ETag: raw ETag with Accept-Encoding: gzip must return 200, not 304
+		reqMismatch := httptest.NewRequest("GET", tc.path, nil)
+		reqMismatch.Header.Set("Accept-Encoding", "gzip")
+		reqMismatch.Header.Set("If-None-Match", rawETag)
+		recMismatch := httptest.NewRecorder()
+		e.h.ServeHTTP(recMismatch, reqMismatch)
+		if recMismatch.Code != http.StatusOK {
+			t.Fatalf("%s raw ETag with gzip encoding want 200 got %d", tc.path, recMismatch.Code)
+		}
+
+		// Accept-Encoding: gzip;q=0 must not compress
+		reqQ0 := httptest.NewRequest("GET", tc.path, nil)
+		reqQ0.Header.Set("Accept-Encoding", "gzip;q=0")
+		recQ0 := httptest.NewRecorder()
+		e.h.ServeHTTP(recQ0, reqQ0)
+		if recQ0.Header().Get("Content-Encoding") != "" {
+			t.Fatalf("%s q=0 should not gzip", tc.path)
+		}
+	}
+}
+
+func TestRelayWaiterCaps429(t *testing.T) {
+	e := newTestEnv(t, Options{})
+
+	// Per-room cap
+	rm := e.s.relay.getRoom("caproom", true)
+	rm.mu.Lock()
+	for i := 0; i < relayMaxWaitersPerRoom; i++ {
+		rm.waiters[make(chan struct{})] = struct{}{}
+	}
+	rm.mu.Unlock()
+
+	code, out, _ := e.do("GET", "/api/v1/relay/caproom?since=0&wait=5", nil)
+	if code != http.StatusTooManyRequests || out["error"] != "too_many_waiters" {
+		t.Fatalf("per-room cap want 429 too_many_waiters got %d %v", code, out)
+	}
+
+	// Global cap
+	e.s.relay.waiters.Store(relayMaxWaitersTotal)
+	code, out, _ = e.do("GET", "/api/v1/relay/otherroom?since=0&wait=5", nil)
+	if code != http.StatusTooManyRequests || out["error"] != "too_many_waiters" {
+		t.Fatalf("global cap want 429 too_many_waiters got %d %v", code, out)
+	}
+	e.s.relay.waiters.Store(0)
+}
+
+func TestRelayEvictionProtectsActiveWaiters(t *testing.T) {
+	hub := newRelayHub()
+	defer hub.Close()
+
+	base := time.Now().Add(-2 * time.Hour)
+	var waiterCh chan struct{}
+	for i := 0; i < relayMaxRooms; i++ {
+		id := fmt.Sprintf("wroom_%03d", i)
+		rm := hub.getRoom(id, true)
+		rm.mu.Lock()
+		rm.updated = base.Add(time.Duration(i) * time.Second)
+		if i == 0 {
+			waiterCh = make(chan struct{})
+			rm.waiters[waiterCh] = struct{}{}
+		}
+		rm.mu.Unlock()
+	}
+
+	// Evicting to make room for wroom_new must skip wroom_000 (has active waiter) and evict wroom_001.
+	if rm := hub.getRoom("wroom_new", true); rm == nil {
+		t.Fatal("expected wroom_new to be created")
+	}
+	if hub.getRoom("wroom_000", false) == nil {
+		t.Fatal("expected wroom_000 with active waiter to be preserved")
+	}
+	if hub.getRoom("wroom_001", false) != nil {
+		t.Fatal("expected idle oldest wroom_001 to be evicted")
+	}
+
+	// If an active-waiter room is stale (> relayRoomMaxAge), eviction must notify waiter before deleting.
+	rm0 := hub.getRoom("wroom_000", false)
+	rm0.mu.Lock()
+	rm0.updated = time.Now().Add(-relayRoomMaxAge - time.Minute)
+	rm0.mu.Unlock()
+
+	if rm := hub.getRoom("wroom_new2", true); rm == nil {
+		t.Fatal("expected wroom_new2 to be created")
+	}
+	select {
+	case <-waiterCh:
+	default:
+		t.Fatal("expected waiter channel on stale room to be closed before eviction")
+	}
+	if hub.getRoom("wroom_000", false) != nil {
+		t.Fatal("expected stale wroom_000 to be evicted")
+	}
+}
+
+func TestRelayJanitorAndShutdownNoLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	hub := newRelayHubWithJanitor(10 * time.Millisecond)
+
+	rm := hub.getRoom("stale_room", true)
+	rm.mu.Lock()
+	rm.updated = time.Now().Add(-relayRoomMaxAge - time.Minute)
+	rm.item = &relayItem{
+		Seq:       1,
+		Room:      "stale_room",
+		URL:       "https://example.com",
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	waitCh := make(chan struct{})
+	rm.waiters[waitCh] = struct{}{}
+	rm.mu.Unlock()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if hub.getRoom("stale_room", false) == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hub.getRoom("stale_room", false) != nil {
+		t.Fatal("janitor did not purge stale room")
+	}
+	select {
+	case <-waitCh:
+	default:
+		t.Fatal("janitor did not notify waiter on purged stale room")
+	}
+
+	hub.Close()
+	hub.Close() // idempotent
+
+	// Allow runtime scheduler a brief moment to park exited goroutine.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.Gosched()
+	}()
+	wg.Wait()
+	if after := runtime.NumGoroutine(); after > before+1 {
+		t.Fatalf("goroutine leak detected: before=%d after=%d", before, after)
 	}
 }

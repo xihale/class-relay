@@ -2,7 +2,11 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -10,7 +14,10 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"path"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func init() {
@@ -34,10 +41,20 @@ type Options struct {
 	TrustProxy bool
 }
 
+type staticAsset struct {
+	raw         []byte
+	gz          []byte
+	etag        string
+	gzETag      string
+	contentType string
+	cacheCtrl   string
+}
+
 type Server struct {
 	relay      *relayHub
 	trustProxy bool
 	mux        *http.ServeMux
+	assets     map[string]*staticAsset
 }
 
 func New(opt Options) *Server {
@@ -45,9 +62,16 @@ func New(opt Options) *Server {
 		relay:      newRelayHub(),
 		trustProxy: opt.TrustProxy,
 		mux:        http.NewServeMux(),
+		assets:     buildStaticAssets(),
 	}
 	s.routes()
 	return s
+}
+
+func (s *Server) Close() {
+	if s.relay != nil {
+		s.relay.Close()
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -76,26 +100,156 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /relay", redirectRoot)
 	m.HandleFunc("GET /relay/{$}", redirectRoot)
 
+	m.Handle("GET /", http.HandlerFunc(s.handleStatic))
+}
+
+func isCompressibleExt(ext string) bool {
+	switch ext {
+	case ".wasm", ".js", ".css", ".html", ".svg":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildStaticAssets() map[string]*staticAsset {
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		log.Fatalf("embedded static fs error: %v", err)
 	}
-	m.Handle("GET /", noCache(http.FileServerFS(sub)))
+	assets := make(map[string]*staticAsset)
+	err = fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		raw, err := fs.ReadFile(sub, p)
+		if err != nil {
+			return err
+		}
+		urlPath := "/" + p
+		sum := sha256.Sum256(raw)
+		hashHex := hex.EncodeToString(sum[:8])
+		ext := strings.ToLower(path.Ext(p))
+		ct := mime.TypeByExtension(ext)
+		if ct == "" {
+			ct = http.DetectContentType(raw)
+		}
+		cc := "no-cache"
+		if strings.HasPrefix(urlPath, "/vendor/") {
+			cc = "public, max-age=604800"
+		}
+		asset := &staticAsset{
+			raw:         raw,
+			etag:        `"` + hashHex + `"`,
+			contentType: ct,
+			cacheCtrl:   cc,
+		}
+		if isCompressibleExt(ext) {
+			var buf bytes.Buffer
+			gw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+			if err == nil {
+				if _, werr := gw.Write(raw); werr == nil && gw.Close() == nil && buf.Len() < len(raw) {
+					asset.gz = buf.Bytes()
+					asset.gzETag = `"` + hashHex + `-gz"`
+				}
+			}
+		}
+		assets[urlPath] = asset
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("walk embedded static fs error: %v", err)
+	}
+	return assets
 }
 
-func noCache(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/vendor/") {
-			w.Header().Set("Cache-Control", "public, max-age=604800")
-		} else {
-			w.Header().Set("Cache-Control", "no-cache")
+func acceptsGzip(r *http.Request) bool {
+	ae := r.Header.Get("Accept-Encoding")
+	for _, part := range strings.Split(ae, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
 		}
-		next.ServeHTTP(w, r)
-	})
+		enc, params, _ := strings.Cut(part, ";")
+		if strings.EqualFold(strings.TrimSpace(enc), "gzip") {
+			for _, p := range strings.Split(params, ";") {
+				k, v, ok := strings.Cut(strings.TrimSpace(p), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(k), "q") {
+					if q, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && q == 0 {
+						return false
+					}
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func ifNoneMatch(headerVal, etag string) bool {
+	if headerVal == "" {
+		return false
+	}
+	if strings.TrimSpace(headerVal) == "*" {
+		return true
+	}
+	for _, part := range strings.Split(headerVal, ",") {
+		tag := strings.TrimSpace(part)
+		tag = strings.TrimPrefix(tag, "W/")
+		if tag == etag {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	urlPath := path.Clean(r.URL.Path)
+	if urlPath == "/" {
+		urlPath = "/index.html"
+	}
+	asset, ok := s.assets[urlPath]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	h := w.Header()
+	h.Set("Cache-Control", asset.cacheCtrl)
+	useGzip := asset.gz != nil && acceptsGzip(r)
+	if asset.gz != nil {
+		h.Set("Vary", "Accept-Encoding")
+	}
+	etag := asset.etag
+	body := asset.raw
+	if useGzip {
+		etag = asset.gzETag
+		body = asset.gz
+	}
+	h.Set("ETag", etag)
+
+	if ifNoneMatch(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	h.Set("Content-Type", asset.contentType)
+	if useGzip {
+		h.Set("Content-Encoding", "gzip")
+	}
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
 }
 
 func (s *Server) secure(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(15 * time.Second))
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
