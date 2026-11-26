@@ -7,6 +7,10 @@ const STORAGE_RECENT_ROOMS = 'class-relay-recent-rooms';
 const STORAGE_MODE = 'class-relay-mode';
 const LEGACY_DEFAULT_ROOM = 'dorm402';
 const MAX_RECENT_ROOMS = 5;
+
+function isLegacyDefaultRoom(room: string): boolean {
+  return room.trim().toLowerCase() === LEGACY_DEFAULT_ROOM;
+}
 const STORAGE_AUTO = 'class-relay-auto';
 const STORAGE_SOURCE = 'class-relay-source';
 const STORAGE_TTL = 'class-relay-ttl';
@@ -92,7 +96,12 @@ export function loadRecentRooms(): string[] {
   if (!Array.isArray(raw)) return [];
   const out: string[] = [];
   for (const item of raw) {
-    if (typeof item === 'string' && VALID_ROOM_RE.test(item) && !out.includes(item)) {
+    if (
+      typeof item === 'string' &&
+      VALID_ROOM_RE.test(item) &&
+      !isLegacyDefaultRoom(item) &&
+      !out.includes(item)
+    ) {
       out.push(item);
       if (out.length >= MAX_RECENT_ROOMS) break;
     }
@@ -102,7 +111,7 @@ export function loadRecentRooms(): string[] {
 
 export function recordRecentRoom(room: string): string[] {
   const cleaned = String(room || '').trim();
-  if (!VALID_ROOM_RE.test(cleaned)) return loadRecentRooms();
+  if (!VALID_ROOM_RE.test(cleaned) || isLegacyDefaultRoom(cleaned)) return loadRecentRooms();
   const next = [cleaned, ...loadRecentRooms().filter((r) => r !== cleaned)].slice(
     0,
     MAX_RECENT_ROOMS,
@@ -115,33 +124,17 @@ export function initialRoom(): string {
   if (typeof location !== 'undefined') {
     const qs = new URLSearchParams(location.search);
     const qRoom = (qs.get('room') || '').trim();
-    if (VALID_ROOM_RE.test(qRoom)) {
-      try {
-        globalThis.localStorage?.setItem(STORAGE_ROOM, qRoom);
-      } catch {
-        // ignore
-      }
+    if (VALID_ROOM_RE.test(qRoom) && !isLegacyDefaultRoom(qRoom)) {
       recordRecentRoom(qRoom);
       return qRoom;
     }
   }
   try {
-    const saved = globalThis.localStorage?.getItem(STORAGE_ROOM);
-    if (saved && VALID_ROOM_RE.test(saved) && saved !== LEGACY_DEFAULT_ROOM) {
-      recordRecentRoom(saved);
-      return saved;
-    }
+    globalThis.localStorage?.removeItem(STORAGE_ROOM);
   } catch {
     // ignore
   }
-  const generated = randomRoomId();
-  try {
-    globalThis.localStorage?.setItem(STORAGE_ROOM, generated);
-  } catch {
-    // ignore
-  }
-  recordRecentRoom(generated);
-  return generated;
+  return randomRoomId();
 }
 
 export function initialMode(): Role {
@@ -358,7 +351,6 @@ export function remainSeconds(expiresAtLocal: number, now = Date.now()): number 
 
 export function syncUrl(room: string, mode: Role): void {
   try {
-    globalThis.localStorage?.setItem(STORAGE_ROOM, room);
     globalThis.localStorage?.setItem(STORAGE_MODE, mode);
   } catch {
     // ignore

@@ -22,7 +22,7 @@ export function RoomBar({ room, onChangeRoom }: RoomBarProps) {
 
   useEffect(() => {
     setDraft(room);
-    setRecentRooms(recordRecentRoom(room));
+    setRecentRooms(loadRecentRooms());
   }, [room]);
 
   const handleSubmit = (e: Event) => {
@@ -32,11 +32,13 @@ export function RoomBar({ room, onChangeRoom }: RoomBarProps) {
       showToast('房间号需为 3~32 位数字、字母、- 或 _');
       return;
     }
+    setRecentRooms(recordRecentRoom(cleaned));
     onChangeRoom(cleaned);
     setExpanded(false);
   };
 
   const handleCopyText = async (text: string, okText: string) => {
+    setRecentRooms(recordRecentRoom(room));
     const ok = await copyText(text);
     showToast(ok ? okText : '复制失败，请手动复制');
   };
@@ -54,7 +56,15 @@ export function RoomBar({ room, onChangeRoom }: RoomBarProps) {
           class="room-pill-btn"
           aria-expanded={expanded}
           aria-controls="room-drawer"
-          onClick={() => setExpanded((v) => !v)}
+          onClick={() => {
+            setExpanded((v) => {
+              const next = !v;
+              if (next) {
+                setRecentRooms(loadRecentRooms());
+              }
+              return next;
+            });
+          }}
         >
           <span class="room-prefix">房间</span>
           <span class="room-code">{room}</span>
@@ -113,6 +123,7 @@ export function RoomBar({ room, onChangeRoom }: RoomBarProps) {
                   type="button"
                   class="room-recent-chip"
                   onClick={() => {
+                    setRecentRooms(recordRecentRoom(item));
                     onChangeRoom(item);
                     setExpanded(false);
                   }}

@@ -12,6 +12,7 @@ import {
   loadSource,
   loadTtl,
   loadWarmed,
+  recordRecentRoom,
   recordWarmed,
   remainSeconds,
   saveAutoRedirect,
@@ -88,11 +89,14 @@ export function App() {
       const curMode = modeRef.current;
       const curAuto = autoRedirectRef.current;
 
-      if (item && curMode === 'recv') {
-        const key = `${curRoom}:${item.seq}`;
-        if (lastDeliveredKeyRef.current !== key) {
-          lastDeliveredKeyRef.current = key;
-          transport.sendReceipt(item.seq, 'delivered');
+      if (item) {
+        recordRecentRoom(curRoom);
+        if (curMode === 'recv') {
+          const key = `${curRoom}:${item.seq}`;
+          if (lastDeliveredKeyRef.current !== key) {
+            lastDeliveredKeyRef.current = key;
+            transport.sendReceipt(item.seq, 'delivered');
+          }
         }
       }
 
@@ -222,6 +226,7 @@ export function App() {
     setSenderError('');
     try {
       await transport.push({ url, source, ttlSec });
+      recordRecentRoom(roomRef.current);
       setSenderUrl(url);
       showToast(`已发送到房间 ${roomRef.current}`);
       return true;
