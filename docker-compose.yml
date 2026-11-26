@@ -1,5 +1,6 @@
 # 启动：cp .env.example .env && docker compose up -d --build
-# 对外请放在 HTTPS 反向代理（Caddy / Nginx）后面，并开启 TRUST_PROXY=1。
+# 含 Caddy 自动 HTTPS + HTTP/3 (QUIC) 边缘代理：
+#   RELAY_DOMAIN=relay.example.com docker compose --profile edge up -d --build
 services:
   class-relay:
     build: .
@@ -12,3 +13,24 @@ services:
     environment:
       ADDR: ":8080"
       TRUST_PROXY: "${TRUST_PROXY:-1}"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["edge"]
+    restart: unless-stopped
+    depends_on:
+      - class-relay
+    ports:
+      - "80:80"
+      - "443:443/tcp"
+      - "443:443/udp"
+    environment:
+      RELAY_DOMAIN: "${RELAY_DOMAIN:-:80}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

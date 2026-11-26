@@ -1,0 +1,14 @@
+# Caddy 反向代理配置（自动 HTTPS / TLS 1.3 + HTTP/3 QUIC）
+#
+# 设置环境变量 RELAY_DOMAIN=relay.example.com 后，Caddy 会自动申请并续期
+# Let's Encrypt 证书，同时启用 TLS 1.3 与 HTTP/3（QUIC，需开放 UDP 443 端口）。
+# 未设置 RELAY_DOMAIN 时默认监听 :80（仅适合本地测试）。
+
+{$RELAY_DOMAIN::80} {
+	encode zstd gzip
+
+	reverse_proxy class-relay:8080 {
+		# 禁用响应缓冲，确保 SSE（/events）与实时流低延迟推送
+		flush_interval -1
+	}
+}

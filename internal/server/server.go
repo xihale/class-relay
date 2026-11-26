@@ -24,7 +24,7 @@ func init() {
 	_ = mime.AddExtensionType(".wasm", "application/wasm")
 }
 
-//go:embed all:static
+//go:embed all:dist
 var staticFS embed.FS
 
 const cspHeader = "default-src 'self'; " +
@@ -32,9 +32,11 @@ const cspHeader = "default-src 'self'; " +
 	"worker-src 'self'; " +
 	"style-src 'self'; " +
 	"img-src 'self' data: blob:; " +
-	"connect-src 'self'; " +
 	"media-src 'self' blob:; " +
-	"frame-ancestors 'none'"
+	"connect-src 'self' ws: wss:; " +
+	"base-uri 'none'; " +
+	"frame-ancestors 'none'; " +
+	"form-action 'self'"
 
 // Options 控制服务行为。
 type Options struct {
@@ -88,6 +90,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/v1/relay/{room}", s.handleRelayPush)
 	m.HandleFunc("GET /api/v1/relay/{room}", s.handleRelayPoll)
 	m.HandleFunc("DELETE /api/v1/relay/{room}", s.handleRelayClear)
+	m.HandleFunc("POST /api/v1/relay/{room}/receipt", s.handleRelayReceipt)
+	m.HandleFunc("GET /api/v1/relay/{room}/ws", s.handleRelayWS)
+	m.HandleFunc("GET /api/v1/relay/{room}/events", s.handleRelaySSE)
 
 	// 兼容旧 /relay 与 /relay/ 路径，保留原始 query 参数重定向到 /
 	redirectRoot := func(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +118,7 @@ func isCompressibleExt(ext string) bool {
 }
 
 func buildStaticAssets() map[string]*staticAsset {
-	sub, err := fs.Sub(staticFS, "static")
+	sub, err := fs.Sub(staticFS, "dist")
 	if err != nil {
 		log.Fatalf("embedded static fs error: %v", err)
 	}
@@ -138,7 +143,10 @@ func buildStaticAssets() map[string]*staticAsset {
 			ct = http.DetectContentType(raw)
 		}
 		cc := "no-cache"
-		if strings.HasPrefix(urlPath, "/vendor/") {
+		switch {
+		case strings.HasPrefix(urlPath, "/assets/"):
+			cc = "public, max-age=31536000, immutable"
+		case strings.HasPrefix(urlPath, "/vendor/"):
 			cc = "public, max-age=604800"
 		}
 		asset := &staticAsset{
@@ -247,9 +255,15 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func isStreamingPath(p string) bool {
+	return strings.HasSuffix(p, "/ws") || strings.HasSuffix(p, "/events")
+}
+
 func (s *Server) secure(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(15 * time.Second))
+		if !isStreamingPath(r.URL.Path) {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(15 * time.Second))
+		}
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")

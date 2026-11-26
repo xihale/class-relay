@@ -36,18 +36,55 @@ type relayItem struct {
 	ExpiresAt time.Time `json:"expiresAt"`
 }
 
+type relayPeers struct {
+	Total int `json:"total"`
+	Recv  int `json:"recv"`
+	Send  int `json:"send"`
+}
+
+type relayReceipts struct {
+	Delivered int `json:"delivered"`
+	Jumped    int `json:"jumped"`
+}
+
+type relaySnapshot struct {
+	Room       string        `json:"room"`
+	Seq        int64         `json:"seq"`
+	Active     bool          `json:"active"`
+	URL        string        `json:"url,omitempty"`
+	Source     string        `json:"source,omitempty"`
+	Host       string        `json:"host,omitempty"`
+	CreatedAt  int64         `json:"createdAt,omitempty"`
+	ExpiresAt  int64         `json:"expiresAt,omitempty"`
+	ServerTime int64         `json:"serverTime"`
+	Peers      relayPeers    `json:"peers"`
+	Receipts   relayReceipts `json:"receipts"`
+}
+
+type subscriber struct {
+	id      uint64
+	roleSeq uint64
+	cid     string
+	role    string // "recv" | "send"
+	ch      chan struct{}
+}
+
 type relayRoom struct {
-	mu      sync.Mutex
-	seq     int64
-	item    *relayItem
-	updated time.Time
-	waiters map[chan struct{}]struct{}
+	mu          sync.Mutex
+	seq         int64
+	item        *relayItem
+	updated     time.Time
+	waiters     map[chan struct{}]struct{}
+	subs        map[uint64]*subscriber
+	deliveredBy map[string]struct{}
+	jumpedBy    map[string]struct{}
 }
 
 type relayHub struct {
 	mu        sync.Mutex
 	rooms     map[string]*relayRoom
 	waiters   atomic.Int64
+	nextSubID atomic.Uint64
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	closeOnce sync.Once
@@ -101,9 +138,9 @@ func (h *relayHub) sweep(now time.Time) {
 		if expired {
 			rm.item = nil
 		}
-		remove := (expired && now.Sub(rm.updated) > 5*time.Minute) || now.Sub(rm.updated) > relayRoomMaxAge
+		remove := (expired && now.Sub(rm.updated) > 5*time.Minute && len(rm.subs) == 0) || now.Sub(rm.updated) > relayRoomMaxAge
 		if remove {
-			if len(rm.waiters) > 0 {
+			if len(rm.waiters) > 0 || len(rm.subs) > 0 {
 				rm.notifyLocked()
 			}
 			rm.mu.Unlock()
@@ -130,8 +167,11 @@ func (h *relayHub) getRoom(id string, create bool) *relayRoom {
 		return nil
 	}
 	rm := &relayRoom{
-		updated: time.Now(),
-		waiters: make(map[chan struct{}]struct{}),
+		updated:     time.Now(),
+		waiters:     make(map[chan struct{}]struct{}),
+		subs:        make(map[uint64]*subscriber),
+		deliveredBy: make(map[string]struct{}),
+		jumpedBy:    make(map[string]struct{}),
 	}
 	h.rooms[id] = rm
 	return rm
@@ -143,12 +183,12 @@ func (h *relayHub) evictLocked(now time.Time) {
 	var oldestTime time.Time
 	for id, rm := range h.rooms {
 		rm.mu.Lock()
-		expired := rm.item != nil && !rm.item.ExpiresAt.After(now) && now.Sub(rm.updated) > 5*time.Minute
+		expired := rm.item != nil && !rm.item.ExpiresAt.After(now) && now.Sub(rm.updated) > 5*time.Minute && len(rm.subs) == 0
 		stale := now.Sub(rm.updated) > relayRoomMaxAge
-		hasWaiters := len(rm.waiters) > 0
+		hasActive := len(rm.waiters) > 0 || len(rm.subs) > 0
 		upd := rm.updated
 		if expired || stale {
-			if hasWaiters {
+			if hasActive {
 				rm.notifyLocked()
 			}
 			rm.mu.Unlock()
@@ -156,7 +196,7 @@ func (h *relayHub) evictLocked(now time.Time) {
 			continue
 		}
 		rm.mu.Unlock()
-		if !hasWaiters && (oldestID == "" || upd.Before(oldestTime)) {
+		if !hasActive && (oldestID == "" || upd.Before(oldestTime)) {
 			oldestID = id
 			oldestTime = upd
 		}
@@ -167,6 +207,12 @@ func (h *relayHub) evictLocked(now time.Time) {
 }
 
 func (rm *relayRoom) notifyLocked() {
+	for _, sub := range rm.subs {
+		select {
+		case sub.ch <- struct{}{}:
+		default:
+		}
+	}
 	for ch := range rm.waiters {
 		close(ch)
 		delete(rm.waiters, ch)
@@ -179,6 +225,76 @@ func (rm *relayRoom) activeItemLocked(now time.Time) *relayItem {
 	}
 	cp := *rm.item
 	return &cp
+}
+
+func (rm *relayRoom) peersLocked() relayPeers {
+	var recv, send int
+	latestByCID := make(map[string]*subscriber, len(rm.subs))
+	for _, sub := range rm.subs {
+		if sub.cid == "" {
+			if sub.role == "send" {
+				send++
+			} else {
+				recv++
+			}
+			continue
+		}
+		prev, exists := latestByCID[sub.cid]
+		if !exists || sub.roleSeq > prev.roleSeq {
+			latestByCID[sub.cid] = sub
+		}
+	}
+	for _, sub := range latestByCID {
+		if sub.role == "send" {
+			send++
+		} else {
+			recv++
+		}
+	}
+	return relayPeers{
+		Total: recv + send,
+		Recv:  recv,
+		Send:  send,
+	}
+}
+
+func (rm *relayRoom) receiptsLocked(now time.Time) relayReceipts {
+	if rm.item == nil || !rm.item.ExpiresAt.After(now) {
+		return relayReceipts{}
+	}
+	return relayReceipts{
+		Delivered: len(rm.deliveredBy),
+		Jumped:    len(rm.jumpedBy),
+	}
+}
+
+func (rm *relayRoom) snapshotLocked(roomID string, now time.Time) relaySnapshot {
+	snap := relaySnapshot{
+		Room:       roomID,
+		Seq:        rm.seq,
+		Active:     false,
+		ServerTime: now.UnixMilli(),
+		Peers:      rm.peersLocked(),
+		Receipts:   rm.receiptsLocked(now),
+	}
+	if cur := rm.activeItemLocked(now); cur != nil {
+		snap.Active = true
+		snap.URL = cur.URL
+		snap.Source = cur.Source
+		snap.Host = cur.Host
+		snap.CreatedAt = cur.CreatedAt.UnixMilli()
+		snap.ExpiresAt = cur.ExpiresAt.UnixMilli()
+	}
+	return snap
+}
+
+func emptySnapshot(roomID string, now time.Time) relaySnapshot {
+	return relaySnapshot{
+		Room:       roomID,
+		Seq:        0,
+		Active:     false,
+		ServerTime: now.UnixMilli(),
+	}
 }
 
 func validRelayURL(raw string) (*url.URL, string) {
@@ -206,6 +322,155 @@ func clampSource(s string) string {
 	return s
 }
 
+func clampCID(s string) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) > 64 {
+		return string(r[:64])
+	}
+	return s
+}
+
+func normalizeRole(role string) string {
+	if strings.EqualFold(strings.TrimSpace(role), "send") {
+		return "send"
+	}
+	return "recv"
+}
+
+func (s *Server) pushToRoom(roomID, rawURL, source string, ttlSec int) (relaySnapshot, int, string, string) {
+	parsed, errMsg := validRelayURL(rawURL)
+	if errMsg != "" {
+		return relaySnapshot{}, http.StatusBadRequest, "bad_url", errMsg
+	}
+	ttl := relayDefaultTTL
+	if ttlSec > 0 {
+		ttl = time.Duration(ttlSec) * time.Second
+		if ttl < relayMinTTL {
+			ttl = relayMinTTL
+		} else if ttl > relayMaxTTL {
+			ttl = relayMaxTTL
+		}
+	}
+
+	now := time.Now()
+	rm := s.relay.getRoom(roomID, true)
+	if rm == nil {
+		return relaySnapshot{}, http.StatusTooManyRequests, "too_many_rooms", "房间数量已达上限，请稍后再试"
+	}
+	rm.mu.Lock()
+	rm.seq++
+	rm.item = &relayItem{
+		Seq:       rm.seq,
+		Room:      roomID,
+		URL:       parsed.String(),
+		Source:    clampSource(source),
+		Host:      parsed.Host,
+		CreatedAt: now,
+		ExpiresAt: now.Add(ttl),
+	}
+	rm.deliveredBy = make(map[string]struct{})
+	rm.jumpedBy = make(map[string]struct{})
+	rm.updated = now
+	rm.notifyLocked()
+	snap := rm.snapshotLocked(roomID, now)
+	rm.mu.Unlock()
+
+	return snap, http.StatusOK, "", ""
+}
+
+func (s *Server) clearRoom(roomID string) relaySnapshot {
+	now := time.Now()
+	rm := s.relay.getRoom(roomID, false)
+	if rm == nil {
+		return emptySnapshot(roomID, now)
+	}
+	rm.mu.Lock()
+	rm.seq++
+	rm.item = nil
+	rm.deliveredBy = make(map[string]struct{})
+	rm.jumpedBy = make(map[string]struct{})
+	rm.updated = now
+	rm.notifyLocked()
+	snap := rm.snapshotLocked(roomID, now)
+	rm.mu.Unlock()
+	return snap
+}
+
+func (s *Server) recordReceipt(roomID string, seq int64, cid, kind string) relayReceipts {
+	rm := s.relay.getRoom(roomID, false)
+	if rm == nil {
+		return relayReceipts{}
+	}
+	now := time.Now()
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if rm.item != nil && rm.item.ExpiresAt.After(now) && seq == rm.seq && cid != "" {
+		changed := false
+		switch kind {
+		case "delivered":
+			if _, exists := rm.deliveredBy[cid]; !exists {
+				rm.deliveredBy[cid] = struct{}{}
+				changed = true
+			}
+		case "jumped":
+			if _, exists := rm.jumpedBy[cid]; !exists {
+				rm.jumpedBy[cid] = struct{}{}
+				changed = true
+			}
+		}
+		if changed {
+			rm.updated = now
+			rm.notifyLocked()
+		}
+	}
+	return rm.receiptsLocked(now)
+}
+
+func (s *Server) subscribe(roomID, cid, role string) (*relayRoom, *subscriber, int, string, string) {
+	rm := s.relay.getRoom(roomID, true)
+	if rm == nil {
+		return nil, nil, http.StatusTooManyRequests, "too_many_rooms", "房间数量已达上限，请稍后再试"
+	}
+
+	id := s.relay.nextSubID.Add(1)
+	sub := &subscriber{
+		id:      id,
+		roleSeq: id,
+		cid:     clampCID(cid),
+		role:    normalizeRole(role),
+		ch:      make(chan struct{}, 1),
+	}
+
+	rm.mu.Lock()
+	if len(rm.subs)+len(rm.waiters) >= relayMaxWaitersPerRoom {
+		rm.mu.Unlock()
+		return nil, nil, http.StatusTooManyRequests, "too_many_waiters", "当前房间等待连接数已达上限，请稍后再试"
+	}
+	if s.relay.waiters.Add(1) > relayMaxWaitersTotal {
+		s.relay.waiters.Add(-1)
+		rm.mu.Unlock()
+		return nil, nil, http.StatusTooManyRequests, "too_many_waiters", "服务等待连接数已达上限，请稍后再试"
+	}
+	rm.subs[sub.id] = sub
+	rm.updated = time.Now()
+	rm.notifyLocked()
+	rm.mu.Unlock()
+
+	return rm, sub, http.StatusOK, "", ""
+}
+
+func (s *Server) unsubscribe(rm *relayRoom, sub *subscriber) {
+	rm.mu.Lock()
+	if _, ok := rm.subs[sub.id]; ok {
+		delete(rm.subs, sub.id)
+		s.relay.waiters.Add(-1)
+		rm.updated = time.Now()
+		rm.notifyLocked()
+	}
+	rm.mu.Unlock()
+}
+
 func (s *Server) handleRelayPush(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("room")
 	if !relayRoomRe.MatchString(roomID) {
@@ -220,55 +485,12 @@ func (s *Server) handleRelayPush(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	parsed, errMsg := validRelayURL(req.URL)
-	if errMsg != "" {
-		writeErr(w, http.StatusBadRequest, "bad_url", errMsg)
+	snap, status, errCode, errMsg := s.pushToRoom(roomID, req.URL, req.Source, req.TTLSec)
+	if errCode != "" {
+		writeErr(w, status, errCode, errMsg)
 		return
 	}
-	ttl := relayDefaultTTL
-	if req.TTLSec > 0 {
-		ttl = time.Duration(req.TTLSec) * time.Second
-		if ttl < relayMinTTL {
-			ttl = relayMinTTL
-		} else if ttl > relayMaxTTL {
-			ttl = relayMaxTTL
-		}
-	}
-
-	now := time.Now()
-	rm := s.relay.getRoom(roomID, true)
-	if rm == nil {
-		writeErr(w, http.StatusTooManyRequests, "too_many_rooms", "房间数量已达上限，请稍后再试")
-		return
-	}
-	rm.mu.Lock()
-	rm.seq++
-	item := &relayItem{
-		Seq:       rm.seq,
-		Room:      roomID,
-		URL:       parsed.String(),
-		Source:    clampSource(req.Source),
-		Host:      parsed.Host,
-		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
-	}
-	rm.item = item
-	rm.updated = now
-	rm.notifyLocked()
-	cp := *item
-	rm.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"room":       cp.Room,
-		"seq":        cp.Seq,
-		"active":     true,
-		"url":        cp.URL,
-		"source":     cp.Source,
-		"host":       cp.Host,
-		"createdAt":  cp.CreatedAt.UnixMilli(),
-		"expiresAt":  cp.ExpiresAt.UnixMilli(),
-		"serverTime": now.UnixMilli(),
-	})
+	writeJSON(w, http.StatusOK, snap)
 }
 
 func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
@@ -304,12 +526,7 @@ func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "too_many_rooms", "房间数量已达上限，请稍后再试")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"room":       roomID,
-			"seq":        0,
-			"active":     false,
-			"serverTime": time.Now().UnixMilli(),
-		})
+		writeJSON(w, http.StatusOK, emptySnapshot(roomID, time.Now()))
 		return
 	}
 
@@ -318,7 +535,7 @@ func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
 	cur := rm.activeItemLocked(now)
 	hasNewer := (cur != nil && cur.Seq > since) || (cur == nil && since > 0 && rm.seq > since)
 	if !hasNewer && waitDur > 0 {
-		if len(rm.waiters) >= relayMaxWaitersPerRoom {
+		if len(rm.subs)+len(rm.waiters) >= relayMaxWaitersPerRoom {
 			rm.mu.Unlock()
 			writeErr(w, http.StatusTooManyRequests, "too_many_waiters", "当前房间等待连接数已达上限，请稍后再试")
 			return
@@ -339,6 +556,7 @@ func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ch:
 		case <-timer.C:
+		case <-s.relay.stopCh:
 		case <-r.Context().Done():
 			timer.Stop()
 			rm.mu.Lock()
@@ -351,32 +569,11 @@ func (s *Server) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
 		rm.mu.Lock()
 		delete(rm.waiters, ch)
 		now = time.Now()
-		cur = rm.activeItemLocked(now)
 	}
-	seq := rm.seq
+	snap := rm.snapshotLocked(roomID, now)
 	rm.mu.Unlock()
 
-	if cur == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"room":       roomID,
-			"seq":        seq,
-			"active":     false,
-			"serverTime": now.UnixMilli(),
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"room":       roomID,
-		"seq":        cur.Seq,
-		"active":     true,
-		"url":        cur.URL,
-		"source":     cur.Source,
-		"host":       cur.Host,
-		"createdAt":  cur.CreatedAt.UnixMilli(),
-		"expiresAt":  cur.ExpiresAt.UnixMilli(),
-		"serverTime": now.UnixMilli(),
-	})
+	writeJSON(w, http.StatusOK, snap)
 }
 
 func (s *Server) handleRelayClear(w http.ResponseWriter, r *http.Request) {
@@ -385,22 +582,35 @@ func (s *Server) handleRelayClear(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_room", "房间口令需为 3–32 位字母、数字、_ 或 -")
 		return
 	}
-	rm := s.relay.getRoom(roomID, false)
-	now := time.Now()
-	var seq int64
-	if rm != nil {
-		rm.mu.Lock()
-		rm.seq++
-		rm.item = nil
-		rm.updated = now
-		seq = rm.seq
-		rm.notifyLocked()
-		rm.mu.Unlock()
+	snap := s.clearRoom(roomID)
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *Server) handleRelayReceipt(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("room")
+	if !relayRoomRe.MatchString(roomID) {
+		writeErr(w, http.StatusBadRequest, "bad_room", "房间口令需为 3–32 位字母、数字、_ 或 -")
+		return
 	}
+	var req struct {
+		Seq  int64  `json:"seq"`
+		CID  string `json:"cid"`
+		Kind string `json:"kind"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if req.Kind != "delivered" && req.Kind != "jumped" {
+		writeErr(w, http.StatusBadRequest, "bad_receipt", "回执类型仅支持 delivered 或 jumped")
+		return
+	}
+	cid := clampCID(req.CID)
+	if cid == "" {
+		cid = clampCID("ip:" + s.clientIP(r))
+	}
+	receipts := s.recordReceipt(roomID, req.Seq, cid, req.Kind)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"room":       roomID,
-		"seq":        seq,
-		"active":     false,
-		"serverTime": now.UnixMilli(),
+		"ok":       true,
+		"receipts": receipts,
 	})
 }

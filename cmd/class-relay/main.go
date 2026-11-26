@@ -3,7 +3,7 @@
 // 配置（环境变量）：
 //
 //	ADDR        监听地址，默认 :8080
-//	TRUST_PROXY 设为 1 或 true 时信任 X-Forwarded-For / X-Real-IP（反向代理后开启）
+//	TRUST_PROXY 设为 1 或 true 时信任 X-Forwarded-For / X-Real-IP / X-Forwarded-Host（反向代理后开启）
 package main
 
 import (
@@ -60,10 +60,10 @@ func main() {
 	<-stop
 
 	log.Printf("收到退出信号，正在优雅关闭…")
+	srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := hs.Shutdown(ctx); err != nil {
 		log.Printf("关闭服务出错：%v", err)
 	}
-	srv.Close()
 }

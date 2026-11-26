@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 type testEnv struct {
@@ -80,6 +83,12 @@ func TestRelayPushPollClearAndValidation(t *testing.T) {
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Fatalf("api Cache-Control want no-store got %q", cc)
+	}
+	if _, ok := out["peers"].(map[string]any); !ok {
+		t.Fatalf("expected peers in snapshot: %v", out)
+	}
+	if _, ok := out["receipts"].(map[string]any); !ok {
+		t.Fatalf("expected receipts in snapshot: %v", out)
 	}
 
 	// 推送有效链接（测试 TTL 下限夹紧：5 -> 15）
@@ -188,8 +197,22 @@ func TestHealthzRedirectsHeadersAndStatic(t *testing.T) {
 	if code != 200 || out["ok"] != true {
 		t.Fatalf("/healthz want 200 ok:true got %d %v", code, out)
 	}
-	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self' 'wasm-unsafe-eval';") || !strings.Contains(csp, "worker-src 'self';") || strings.Contains(csp, "wx.qq.com") || !strings.Contains(csp, "img-src 'self' data: blob:") || !strings.Contains(csp, "media-src 'self' blob:") {
-		t.Fatalf("unexpected CSP: %q", csp)
+	csp := rec.Header().Get("Content-Security-Policy")
+	for _, want := range []string{
+		"default-src 'self';",
+		"script-src 'self' 'wasm-unsafe-eval';",
+		"worker-src 'self';",
+		"style-src 'self';",
+		"img-src 'self' data: blob:;",
+		"media-src 'self' blob:;",
+		"connect-src 'self' ws: wss:;",
+		"base-uri 'none';",
+		"frame-ancestors 'none';",
+		"form-action 'self'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("CSP missing %q: %q", want, csp)
+		}
 	}
 	if pp := rec.Header().Get("Permissions-Policy"); pp != "camera=(self)" {
 		t.Fatalf("unexpected Permissions-Policy: %q", pp)
@@ -231,15 +254,25 @@ func TestHealthzRedirectsHeadersAndStatic(t *testing.T) {
 		t.Fatalf("GET /vendor/zxing_reader.wasm Cache-Control want public, max-age=604800 got %q", cc)
 	}
 
-	// Web Worker 脚本与 no-cache
-	reqWorker := httptest.NewRequest("GET", "/scanner-worker.js", nil)
-	recWorker := httptest.NewRecorder()
-	e.h.ServeHTTP(recWorker, reqWorker)
-	if recWorker.Code != 200 {
-		t.Fatalf("GET /scanner-worker.js want 200 got %d", recWorker.Code)
+	// /assets/* immutable 缓存
+	var assetPath string
+	for p := range e.s.assets {
+		if strings.HasPrefix(p, "/assets/") {
+			assetPath = p
+			break
+		}
 	}
-	if cc := recWorker.Header().Get("Cache-Control"); cc != "no-cache" {
-		t.Fatalf("GET /scanner-worker.js Cache-Control want no-cache got %q", cc)
+	if assetPath == "" {
+		t.Fatal("expected at least one /assets/ file in embedded dist")
+	}
+	reqAsset := httptest.NewRequest("GET", assetPath, nil)
+	recAsset := httptest.NewRecorder()
+	e.h.ServeHTTP(recAsset, reqAsset)
+	if recAsset.Code != 200 {
+		t.Fatalf("GET %s want 200 got %d", assetPath, recAsset.Code)
+	}
+	if cc := recAsset.Header().Get("Cache-Control"); cc != "public, max-age=31536000, immutable" {
+		t.Fatalf("GET %s Cache-Control want immutable got %q", assetPath, cc)
 	}
 
 	// clientIP with TrustProxy
@@ -287,13 +320,24 @@ func TestRelayPollImmediateAfterDelete(t *testing.T) {
 func TestStaticGzipAndETag304(t *testing.T) {
 	e := newTestEnv(t, Options{})
 
+	var assetPath string
+	for p := range e.s.assets {
+		if strings.HasPrefix(p, "/assets/") && strings.HasSuffix(p, ".js") {
+			assetPath = p
+			break
+		}
+	}
+	if assetPath == "" {
+		t.Fatal("expected a .js asset under /assets/")
+	}
+
 	for _, tc := range []struct {
 		path string
 		ct   string
 		cc   string
 	}{
 		{"/vendor/zxing_reader.wasm", "application/wasm", "public, max-age=604800"},
-		{"/scanner-worker.js", "text/javascript", "no-cache"},
+		{assetPath, "text/javascript", "public, max-age=31536000, immutable"},
 	} {
 		// Uncompressed request
 		reqRaw := httptest.NewRequest("GET", tc.path, nil)
@@ -495,4 +539,322 @@ func TestRelayJanitorAndShutdownNoLeak(t *testing.T) {
 	if after := runtime.NumGoroutine(); after > before+1 {
 		t.Fatalf("goroutine leak detected: before=%d after=%d", before, after)
 	}
+}
+
+func TestRestReceiptEndpoint(t *testing.T) {
+	e := newTestEnv(t, Options{})
+
+	// Push active item
+	code, out, _ := e.do("POST", "/api/v1/relay/rcptroom", map[string]any{
+		"url": "https://example.com/sign",
+	})
+	if code != 200 || int64(out["seq"].(float64)) != 1 {
+		t.Fatalf("push failed: %d %v", code, out)
+	}
+
+	// Bad receipt kind
+	if code, _, _ := e.do("POST", "/api/v1/relay/rcptroom/receipt", map[string]any{
+		"seq": 1, "cid": "c1", "kind": "invalid",
+	}); code != 400 {
+		t.Fatalf("bad kind want 400 got %d", code)
+	}
+
+	// Delivered receipt
+	code, out, _ = e.do("POST", "/api/v1/relay/rcptroom/receipt", map[string]any{
+		"seq": 1, "cid": "c1", "kind": "delivered",
+	})
+	if code != 200 || out["ok"] != true {
+		t.Fatalf("delivered receipt failed: %d %v", code, out)
+	}
+	rcpts := out["receipts"].(map[string]any)
+	if int(rcpts["delivered"].(float64)) != 1 || int(rcpts["jumped"].(float64)) != 0 {
+		t.Fatalf("unexpected receipts: %v", rcpts)
+	}
+
+	// Duplicate cid delivered should be idempotent
+	code, out, _ = e.do("POST", "/api/v1/relay/rcptroom/receipt", map[string]any{
+		"seq": 1, "cid": "c1", "kind": "delivered",
+	})
+	rcpts = out["receipts"].(map[string]any)
+	if code != 200 || int(rcpts["delivered"].(float64)) != 1 {
+		t.Fatalf("duplicate receipt should not double-count: %v", rcpts)
+	}
+
+	// Jumped receipt
+	code, out, _ = e.do("POST", "/api/v1/relay/rcptroom/receipt", map[string]any{
+		"seq": 1, "cid": "c1", "kind": "jumped",
+	})
+	rcpts = out["receipts"].(map[string]any)
+	if code != 200 || int(rcpts["delivered"].(float64)) != 1 || int(rcpts["jumped"].(float64)) != 1 {
+		t.Fatalf("jumped receipt failed: %v", rcpts)
+	}
+
+	// Stale seq should not record
+	code, out, _ = e.do("POST", "/api/v1/relay/rcptroom/receipt", map[string]any{
+		"seq": 99, "cid": "c2", "kind": "delivered",
+	})
+	rcpts = out["receipts"].(map[string]any)
+	if code != 200 || int(rcpts["delivered"].(float64)) != 1 {
+		t.Fatalf("stale seq should not count: %v", rcpts)
+	}
+
+	// New push resets receipts
+	code, out, _ = e.do("POST", "/api/v1/relay/rcptroom", map[string]any{
+		"url": "https://example.com/sign2",
+	})
+	rcpts = out["receipts"].(map[string]any)
+	if code != 200 || int(rcpts["delivered"].(float64)) != 0 || int(rcpts["jumped"].(float64)) != 0 {
+		t.Fatalf("push should reset receipts: %v", rcpts)
+	}
+}
+
+func readWSJSON(t *testing.T, ctx context.Context, conn *websocket.Conn) map[string]any {
+	t.Helper()
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("ws read: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("ws unmarshal %q: %v", string(data), err)
+	}
+	return m
+}
+
+func waitForWSState(t *testing.T, ctx context.Context, conn *websocket.Conn, pred func(map[string]any) bool) map[string]any {
+	t.Helper()
+	for {
+		msg := readWSJSON(t, ctx, conn)
+		if msg["type"] == "state" && pred(msg) {
+			return msg
+		}
+	}
+}
+
+func TestWebSocketPeersPingPushClearAndReceipts(t *testing.T) {
+	srv := New(Options{})
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Connect sender
+	sendConn, _, err := websocket.Dial(ctx, wsURL+"/api/v1/relay/wsroom/ws?role=send&cid=s1", nil)
+	if err != nil {
+		t.Fatalf("dial sender: %v", err)
+	}
+	defer sendConn.CloseNow()
+
+	st := readWSJSON(t, ctx, sendConn)
+	if st["type"] != "state" {
+		t.Fatalf("expected initial state, got %v", st)
+	}
+	peers := st["peers"].(map[string]any)
+	if int(peers["total"].(float64)) != 1 || int(peers["send"].(float64)) != 1 || int(peers["recv"].(float64)) != 0 {
+		t.Fatalf("unexpected sender initial peers: %v", peers)
+	}
+
+	// Connect receiver
+	recvConn, _, err := websocket.Dial(ctx, wsURL+"/api/v1/relay/wsroom/ws?role=recv&cid=r1", nil)
+	if err != nil {
+		t.Fatalf("dial receiver: %v", err)
+	}
+	defer recvConn.CloseNow()
+
+	// Both should see total=2, send=1, recv=1
+	stRecv := waitForWSState(t, ctx, recvConn, func(m map[string]any) bool {
+		p := m["peers"].(map[string]any)
+		return int(p["total"].(float64)) == 2 && int(p["recv"].(float64)) == 1 && int(p["send"].(float64)) == 1
+	})
+	if stRecv["active"] != false {
+		t.Fatalf("expected inactive initially: %v", stRecv)
+	}
+	waitForWSState(t, ctx, sendConn, func(m map[string]any) bool {
+		p := m["peers"].(map[string]any)
+		return int(p["total"].(float64)) == 2
+	})
+
+	// Ping -> Pong
+	if err := sendConn.Write(ctx, websocket.MessageText, []byte(`{"type":"ping"}`)); err != nil {
+		t.Fatal(err)
+	}
+	pong := readWSJSON(t, ctx, sendConn)
+	if pong["type"] != "pong" || pong["serverTime"] == nil {
+		t.Fatalf("expected pong, got %v", pong)
+	}
+
+	// Role switch: r1 switches to send, then back to recv
+	if err := recvConn.Write(ctx, websocket.MessageText, []byte(`{"type":"role","role":"send"}`)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWSState(t, ctx, sendConn, func(m map[string]any) bool {
+		p := m["peers"].(map[string]any)
+		return int(p["send"].(float64)) == 2 && int(p["recv"].(float64)) == 0
+	})
+	if err := recvConn.Write(ctx, websocket.MessageText, []byte(`{"type":"role","role":"recv"}`)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWSState(t, ctx, sendConn, func(m map[string]any) bool {
+		p := m["peers"].(map[string]any)
+		return int(p["send"].(float64)) == 1 && int(p["recv"].(float64)) == 1
+	})
+
+	// WS push (invalid URL -> ack_push ok:false)
+	if err := sendConn.Write(ctx, websocket.MessageText, []byte(`{"type":"push","reqId":"bad1","url":"javascript:alert(1)"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		msg := readWSJSON(t, ctx, sendConn)
+		if msg["type"] == "ack_push" {
+			if msg["reqId"] != "bad1" || msg["ok"] != false || msg["error"] != "bad_url" {
+				t.Fatalf("unexpected bad push ack: %v", msg)
+			}
+			break
+		}
+	}
+
+	// WS push (valid URL)
+	if err := sendConn.Write(ctx, websocket.MessageText, []byte(`{"type":"push","reqId":"req1","url":"https://v18.teachermate.cn/sign","source":"微助教","ttlSec":90}`)); err != nil {
+		t.Fatal(err)
+	}
+	var gotAck bool
+	for !gotAck {
+		msg := readWSJSON(t, ctx, sendConn)
+		if msg["type"] == "ack_push" {
+			if msg["reqId"] != "req1" || msg["ok"] != true {
+				t.Fatalf("unexpected push ack: %v", msg)
+			}
+			gotAck = true
+		}
+	}
+
+	// Receiver gets broadcast
+	recvPush := waitForWSState(t, ctx, recvConn, func(m map[string]any) bool {
+		return m["active"] == true && int64(m["seq"].(float64)) == 1
+	})
+	if recvPush["url"] != "https://v18.teachermate.cn/sign" {
+		t.Fatalf("unexpected pushed url: %v", recvPush)
+	}
+
+	// Receiver sends delivered + jumped receipts
+	if err := recvConn.Write(ctx, websocket.MessageText, []byte(`{"type":"receipt","seq":1,"kind":"delivered"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := recvConn.Write(ctx, websocket.MessageText, []byte(`{"type":"receipt","seq":1,"kind":"jumped"}`)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWSState(t, ctx, sendConn, func(m map[string]any) bool {
+		r := m["receipts"].(map[string]any)
+		return int(r["delivered"].(float64)) == 1 && int(r["jumped"].(float64)) == 1
+	})
+
+	// WS clear
+	if err := sendConn.Write(ctx, websocket.MessageText, []byte(`{"type":"clear","reqId":"clr1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		msg := readWSJSON(t, ctx, sendConn)
+		if msg["type"] == "ack_push" && msg["reqId"] == "clr1" {
+			if msg["ok"] != true {
+				t.Fatalf("clear ack failed: %v", msg)
+			}
+			break
+		}
+	}
+	waitForWSState(t, ctx, recvConn, func(m map[string]any) bool {
+		return m["active"] == false && int64(m["seq"].(float64)) == 2
+	})
+
+	// Disconnect receiver -> sender sees peers drop to 1
+	_ = recvConn.Close(websocket.StatusNormalClosure, "bye")
+	waitForWSState(t, ctx, sendConn, func(m map[string]any) bool {
+		p := m["peers"].(map[string]any)
+		return int(p["total"].(float64)) == 1 && int(p["recv"].(float64)) == 0
+	})
+}
+
+func TestSSEStreamingAndPeers(t *testing.T) {
+	srv := New(Options{})
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/v1/relay/sseroom/events?role=recv&cid=sse1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse connect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("sse status want 200 got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream; charset=utf-8" {
+		t.Fatalf("sse Content-Type got %q", ct)
+	}
+	if xab := resp.Header.Get("X-Accel-Buffering"); xab != "no" {
+		t.Fatalf("sse X-Accel-Buffering got %q", xab)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	readSSEState := func() map[string]any {
+		t.Helper()
+		var eventName, dataLine string
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("sse read: %v", err)
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				if eventName == "state" && dataLine != "" {
+					var m map[string]any
+					if err := json.Unmarshal([]byte(dataLine), &m); err != nil {
+						t.Fatalf("sse json: %v", err)
+					}
+					return m
+				}
+				eventName, dataLine = "", ""
+				continue
+			}
+			if strings.HasPrefix(line, "event: ") {
+				eventName = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				dataLine = strings.TrimPrefix(line, "data: ")
+			}
+		}
+	}
+
+	// Initial SSE state
+	st1 := readSSEState()
+	peers := st1["peers"].(map[string]any)
+	if st1["active"] != false || int(peers["total"].(float64)) != 1 || int(peers["recv"].(float64)) != 1 {
+		t.Fatalf("unexpected initial SSE state: %v", st1)
+	}
+
+	// Push via REST -> SSE receives update
+	pushResp, err := http.Post(ts.URL+"/api/v1/relay/sseroom", "application/json", strings.NewReader(`{"url":"https://www.yuketang.cn/sse","source":"雨课堂"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pushResp.Body.Close()
+	if pushResp.StatusCode != 200 {
+		t.Fatalf("rest push failed: %d", pushResp.StatusCode)
+	}
+
+	st2 := readSSEState()
+	if st2["active"] != true || st2["url"] != "https://www.yuketang.cn/sse" {
+		t.Fatalf("unexpected SSE push update: %v", st2)
+	}
+
+	cancel()
 }
