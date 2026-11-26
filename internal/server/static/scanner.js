@@ -1,5 +1,5 @@
-// Web 扫码器：自托管 zxing-wasm@3.1.7 Classic Worker + 硬件/1:1 传感器像素混合变焦
-// + 4 帧多尺度/图像增强轮转 + 5 阶段高清图片解码 + jsQR 零 WASM 降级兜底。
+// Web 扫码器：自托管 zxing-wasm@3.1.7 Classic Worker + 原生 BarcodeDetector + 自适应低功耗轮询
+// + 有界内存相册识码（支持 AbortSignal）+ 确定性相机生命周期管理。
 
 import { h, icon, openDialog } from './dom.js';
 
@@ -10,24 +10,77 @@ const DIGITAL_STEPS = [1, 1.5, 2, 3, 5];
 const ZOOM_PRESETS = [1, 2, 3, 5];
 const ZOOM_CLASS_LIST = ['zoom-1', 'zoom-1-5', 'zoom-2', 'zoom-3', 'zoom-5'];
 
-// 3x3 重叠网格优先顺序（教室投影高频区域优先：上中、中中、左上、右上…）
-const TILE_ORDER = [
-  [1, 0], [1, 1], [0, 0], [2, 0],
-  [0, 1], [2, 1], [1, 2], [0, 2], [2, 2],
+const MAX_PHOTO_DIM = 1600;
+const PHOTO_BUDGET_MS = 10000;
+
+const TIMEOUT_INIT_MS = 10000;
+const TIMEOUT_LIVE_MS = 2000;
+const TIMEOUT_PHOTO_MS = 6000;
+const IDLE_TERMINATE_MS = 30000;
+const MAX_WORKER_RESTARTS = 2;
+
+// 2x2 重叠象限（60% 宽×高，偏移 0 / 0.4）
+const QUADRANTS = [
+  [0, 0],
+  [0.4, 0],
+  [0, 0.4],
+  [0.4, 0.4],
 ];
 
 let barcodeDetectorPromise = null;
-let jsQRPromise = null;
-let workerInstance = null;
-let workerInitPromise = null;
-let workerFailed = false;
-let workerNextId = 1;
-const workerPending = new Map();
+let activeCameraScanner = null;
 
 export function extractUrl(text) {
   const m = URL_RE.exec(String(text || '').trim());
   if (!m) return '';
   return m[0].replace(TRAILING_PUNCT_RE, '');
+}
+
+export function getScannerSupport() {
+  return {
+    camera: Boolean(
+      typeof navigator !== 'undefined' &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === 'function',
+    ),
+    barcodeDetector: typeof globalThis.BarcodeDetector === 'function',
+    wasmWorker:
+      typeof globalThis.Worker === 'function' &&
+      typeof globalThis.WebAssembly === 'object',
+  };
+}
+
+function createAbortError() {
+  return new DOMException('Aborted', 'AbortError');
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) throw createAbortError();
+}
+
+function yieldToMain(signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(createAbortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (signal && signal.aborted) reject(createAbortError());
+      else resolve();
+    }, 0);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(createAbortError());
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function zeroCanvas(canvas) {
+  if (!canvas) return;
+  canvas.width = 0;
+  canvas.height = 0;
 }
 
 async function getBarcodeDetector() {
@@ -47,158 +100,233 @@ async function getBarcodeDetector() {
   return barcodeDetectorPromise;
 }
 
-function ensureJsQR() {
-  if (typeof globalThis.jsQR === 'function') return Promise.resolve(globalThis.jsQR);
-  if (jsQRPromise) return jsQRPromise;
-  jsQRPromise = new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = '/vendor/jsqr.js';
-    s.async = true;
-    s.onload = () => {
-      if (typeof globalThis.jsQR === 'function') resolve(globalThis.jsQR);
-      else {
-        jsQRPromise = null;
-        reject(new Error('二维码解码库初始化失败'));
+class ScannerWorkerClient {
+  constructor() {
+    this.worker = null;
+    this.initPromise = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.idleTimer = 0;
+    this.restarts = 0;
+  }
+
+  get supported() {
+    return (
+      typeof globalThis.Worker === 'function' &&
+      typeof globalThis.WebAssembly === 'object'
+    );
+  }
+
+  isIdle() {
+    return this.pending.size === 0;
+  }
+
+  clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = 0;
+    }
+  }
+
+  scheduleIdleTerminate() {
+    this.clearIdleTimer();
+    if (!this.worker || this.pending.size > 0) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = 0;
+      if (this.pending.size === 0 && !activeCameraScanner) {
+        this.terminate('Worker 空闲回收', false);
       }
-    };
-    s.onerror = () => {
-      s.remove();
-      jsQRPromise = null;
-      reject(new Error('无法加载本地二维码解码库'));
-    };
-    document.head.append(s);
-  });
-  return jsQRPromise;
-}
+    }, IDLE_TERMINATE_MS);
+  }
 
-function failAllWorkerPending(err) {
-  workerFailed = true;
-  for (const [, entry] of workerPending) {
-    entry.reject(err);
-  }
-  workerPending.clear();
-  if (workerInstance) {
-    try { workerInstance.terminate(); } catch { /* ignore */ }
-    workerInstance = null;
-  }
-  workerInitPromise = null;
-}
-
-function terminateWorker() {
-  const err = new Error('Worker 已终止');
-  for (const [, entry] of workerPending) {
-    entry.reject(err);
-  }
-  workerPending.clear();
-  if (workerInstance) {
-    try { workerInstance.terminate(); } catch { /* ignore */ }
-    workerInstance = null;
-  }
-  workerInitPromise = null;
-}
-
-function sendWorkerRequest(payload, transfer = []) {
-  return new Promise((resolve, reject) => {
-    if (!workerInstance || workerFailed) {
-      reject(new Error('Worker 不可用'));
-      return;
+  terminate(reason = 'Worker 已终止', countAsFailure = false) {
+    this.clearIdleTimer();
+    const err = new Error(reason);
+    for (const [, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      if (entry.onAbort && entry.signal) {
+        entry.signal.removeEventListener('abort', entry.onAbort);
+      }
+      entry.reject(err);
     }
-    const id = workerNextId++;
-    workerPending.set(id, { resolve, reject });
-    try {
-      workerInstance.postMessage({ ...payload, id }, transfer);
-    } catch (err) {
-      workerPending.delete(id);
-      reject(err);
+    this.pending.clear();
+    if (this.worker) {
+      try { this.worker.terminate(); } catch { /* ignore */ }
+      this.worker = null;
     }
-  });
-}
-
-async function ensureWorker() {
-  if (workerFailed) return false;
-  if (workerInitPromise) return workerInitPromise;
-  if (typeof globalThis.Worker !== 'function' || typeof globalThis.WebAssembly !== 'object') {
-    workerFailed = true;
-    return false;
+    this.initPromise = null;
+    if (countAsFailure) {
+      this.restarts++;
+    }
   }
 
-  workerInitPromise = (async () => {
-    let w = null;
-    try {
-      w = new Worker('/scanner-worker.js');
-      workerInstance = w;
-      w.onmessage = (event) => {
-        const msg = event.data || {};
-        const entry = workerPending.get(msg.id);
-        if (!entry) return;
-        workerPending.delete(msg.id);
-        entry.resolve(msg);
-      };
-      w.onerror = (err) => {
-        if (workerInstance === w) {
-          failAllWorkerPending(new Error((err && err.message) || 'Worker 运行异常'));
+  resetRestarts() {
+    this.restarts = 0;
+  }
+
+  dispose() {
+    this.terminate('资源已释放', false);
+    this.restarts = 0;
+  }
+
+  async ensureReady(signal) {
+    throwIfAborted(signal);
+    if (!this.supported) return false;
+    if (this.restarts > MAX_WORKER_RESTARTS) return false;
+    this.clearIdleTimer();
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = (async () => {
+      let w = null;
+      try {
+        w = new Worker('/scanner-worker.js');
+        this.worker = w;
+        w.onmessage = (event) => {
+          const msg = event.data || {};
+          const entry = this.pending.get(msg.id);
+          if (!entry) return;
+          this.pending.delete(msg.id);
+          clearTimeout(entry.timer);
+          if (entry.onAbort && entry.signal) {
+            entry.signal.removeEventListener('abort', entry.onAbort);
+          }
+          entry.resolve(msg);
+          if (this.pending.size === 0) this.scheduleIdleTerminate();
+        };
+        w.onerror = (err) => {
+          if (this.worker === w) {
+            this.terminate((err && err.message) || 'Worker 运行异常', true);
+          }
+        };
+        const res = await this._sendRaw({ type: 'init' }, [], TIMEOUT_INIT_MS, signal);
+        if (!res || !res.ok || this.worker !== w) {
+          if (this.worker === w) {
+            this.terminate((res && res.error) || 'WASM 初始化失败', true);
+          }
+          return false;
         }
-      };
-      const res = await sendWorkerRequest({ type: 'init' });
-      if (!res || !res.ok) {
-        if (workerInstance === w) {
-          failAllWorkerPending(new Error((res && res.error) || 'WASM 初始化失败'));
+        return true;
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          if (this.worker === w) this.terminate('已取消', false);
+          throw err;
+        }
+        if (!w || this.worker === w) {
+          this.terminate((err && err.message) || 'WASM 初始化异常', true);
         }
         return false;
       }
-      return workerInstance === w;
-    } catch (err) {
-      if (!w || workerInstance === w) {
-        failAllWorkerPending(err);
-      }
-      return false;
-    }
-  })();
+    })();
 
-  return workerInitPromise;
-}
-
-async function decodeWithJsQR(ctx, width, height) {
-  const jsQR = await ensureJsQR();
-  const imgData = ctx.getImageData(0, 0, width, height);
-  const res = jsQR(imgData.data, imgData.width, imgData.height, {
-    inversionAttempts: 'attemptBoth',
-  });
-  return res && res.data ? res.data.trim() : '';
-}
-
-async function decodeCanvas(canvas, ctx, { mode = 'fast', useBarcodeDetector = true } = {}) {
-  if (useBarcodeDetector && mode !== 'enhanced') {
-    const detector = await getBarcodeDetector();
-    if (detector) {
-      try {
-        const codes = await detector.detect(canvas);
-        if (codes && codes.length > 0 && codes[0].rawValue) {
-          return codes[0].rawValue.trim();
-        }
-      } catch { /* fall through to WASM */ }
-    }
+    return this.initPromise;
   }
 
-  const workerOk = await ensureWorker();
-  if (workerOk) {
+  _sendRaw(payload, transfer, timeoutMs, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        reject(createAbortError());
+        return;
+      }
+      if (!this.worker) {
+        reject(new Error('Worker 不可用'));
+        return;
+      }
+      this.clearIdleTimer();
+      const id = this.nextId++;
+      const w = this.worker;
+
+      const entry = {
+        resolve,
+        reject,
+        signal,
+        onAbort: null,
+        timer: 0,
+      };
+
+      entry.timer = setTimeout(() => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        if (entry.onAbort && signal) signal.removeEventListener('abort', entry.onAbort);
+        if (this.worker === w) {
+          this.terminate(`Worker 请求超时 (${timeoutMs}ms)`, true);
+        }
+        reject(new Error('Worker 解码超时'));
+      }, timeoutMs);
+
+      if (signal) {
+        entry.onAbort = () => {
+          if (!this.pending.has(id)) return;
+          this.pending.delete(id);
+          clearTimeout(entry.timer);
+          reject(createAbortError());
+        };
+        signal.addEventListener('abort', entry.onAbort, { once: true });
+      }
+
+      this.pending.set(id, entry);
+      try {
+        w.postMessage({ ...payload, id }, transfer);
+      } catch (err) {
+        this.pending.delete(id);
+        clearTimeout(entry.timer);
+        if (entry.onAbort && signal) signal.removeEventListener('abort', entry.onAbort);
+        reject(err);
+      }
+    });
+  }
+
+  async decodeRgba(width, height, buffer, profile, signal) {
+    throwIfAborted(signal);
+    const timeoutMs = profile.startsWith('photo-') ? TIMEOUT_PHOTO_MS : TIMEOUT_LIVE_MS;
+
+    const ready = await this.ensureReady(signal);
+    if (!ready) return '';
+
     try {
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const buf = imgData.data.buffer;
-      const res = await sendWorkerRequest(
-        { type: 'decode-rgba', width: canvas.width, height: canvas.height, buffer: buf, mode },
-        [buf],
+      const res = await this._sendRaw(
+        { type: 'decode-rgba', width, height, buffer, profile },
+        [buffer],
+        timeoutMs,
+        signal,
       );
-      if (res && res.text) return res.text;
-      if (!res || res.error) {
-        // 仅在出错时尝试 jsQR 兜底，正常未检出不重复跑 jsQR
-        if (res && res.error) return decodeWithJsQR(ctx, canvas.width, canvas.height);
+      if (res && res.ok) {
+        this.restarts = 0;
+        return res.text || '';
       }
       return '';
-    } catch { /* fallback to jsQR */ }
+    } catch (err) {
+      if (err && err.name === 'AbortError') throw err;
+      return '';
+    }
   }
 
-  return decodeWithJsQR(ctx, canvas.width, canvas.height);
+  sendReset() {
+    if (!this.worker || this.pending.size > 0) return;
+    this._sendRaw({ type: 'reset' }, [], TIMEOUT_LIVE_MS, null).catch(() => {});
+  }
+}
+
+const workerClient = new ScannerWorkerClient();
+
+export function disposeScannerResources() {
+  workerClient.dispose();
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    if (activeCameraScanner) {
+      activeCameraScanner._closeWithReason('pagehide');
+    }
+    disposeScannerResources();
+  });
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && !activeCameraScanner && workerClient.isIdle()) {
+      workerClient.terminate('页面切至后台释放空闲 Worker', false);
+    }
+  });
 }
 
 function drawRegion(canvas, ctx, source, sx, sy, sw, sh, maxDim, minDim = 0) {
@@ -220,116 +348,245 @@ function drawRegion(canvas, ctx, source, sx, sy, sw, sh, maxDim, minDim = 0) {
     canvas.height = dh;
   }
   ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
+  ctx.imageSmoothingQuality = 'low';
   ctx.drawImage(source, sx, sy, safeW, safeH, 0, 0, dw, dh);
 }
 
-function loadImageElement(blobUrl) {
+async function decodeCanvasWithWorker(canvas, ctx, profile, signal) {
+  throwIfAborted(signal);
+  const w = canvas.width;
+  const h = canvas.height;
+  if (!w || !h) return '';
+  const imgData = ctx.getImageData(0, 0, w, h);
+  return workerClient.decodeRgba(w, h, imgData.data.buffer, profile, signal);
+}
+
+function loadImageElement(blobUrl, signal) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(createAbortError());
+      return;
+    }
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('图片读取失败'));
+    const cleanup = () => {
+      img.onload = null;
+      img.onerror = null;
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      img.src = '';
+      reject(createAbortError());
+    };
+    img.onload = () => {
+      cleanup();
+      resolve(img);
+    };
+    img.onerror = () => {
+      cleanup();
+      reject(new Error('图片读取失败'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     img.src = blobUrl;
   });
 }
 
-async function decodeSourceFiveStage(source, srcW, srcH, { onProgress } = {}) {
+async function loadCappedImageSource(file, signal) {
+  throwIfAborted(signal);
+  const revokeUrl = URL.createObjectURL(file);
+  let bitmap = null;
+  let downscaleCanvas = null;
+
+  try {
+    const img = await loadImageElement(revokeUrl, signal);
+    const natW = img.naturalWidth || img.width;
+    const natH = img.naturalHeight || img.height;
+    if (!natW || !natH) throw new Error('图片尺寸无效');
+
+    const longSide = Math.max(natW, natH);
+    const needsResize = longSide > MAX_PHOTO_DIM;
+    const targetW = needsResize ? Math.max(1, Math.round((natW * MAX_PHOTO_DIM) / longSide)) : natW;
+    const targetH = needsResize ? Math.max(1, Math.round((natH * MAX_PHOTO_DIM) / longSide)) : natH;
+
+    if (typeof createImageBitmap === 'function') {
+      try {
+        bitmap = needsResize
+          ? await createImageBitmap(file, {
+              resizeWidth: targetW,
+              resizeHeight: targetH,
+              resizeQuality: 'medium',
+            })
+          : await createImageBitmap(file);
+        throwIfAborted(signal);
+        return {
+          source: bitmap,
+          width: bitmap.width || targetW,
+          height: bitmap.height || targetH,
+          release: () => {
+            if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+            URL.revokeObjectURL(revokeUrl);
+          },
+        };
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+          throw err;
+        }
+        bitmap = null;
+      }
+    }
+
+    if (needsResize) {
+      downscaleCanvas = document.createElement('canvas');
+      downscaleCanvas.width = targetW;
+      downscaleCanvas.height = targetH;
+      const dctx = downscaleCanvas.getContext('2d');
+      dctx.imageSmoothingEnabled = true;
+      dctx.imageSmoothingQuality = 'medium';
+      dctx.drawImage(img, 0, 0, natW, natH, 0, 0, targetW, targetH);
+      return {
+        source: downscaleCanvas,
+        width: targetW,
+        height: targetH,
+        release: () => {
+          zeroCanvas(downscaleCanvas);
+          URL.revokeObjectURL(revokeUrl);
+        },
+      };
+    }
+
+    return {
+      source: img,
+      width: natW,
+      height: natH,
+      release: () => {
+        URL.revokeObjectURL(revokeUrl);
+      },
+    };
+  } catch (err) {
+    if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+    zeroCanvas(downscaleCanvas);
+    URL.revokeObjectURL(revokeUrl);
+    throw err;
+  }
+}
+
+async function decodeSourceBudgeted(source, srcW, srcH, { signal, onProgress } = {}) {
+  throwIfAborted(signal);
+  const detector = await getBarcodeDetector();
+  throwIfAborted(signal);
+
+  const deadline = performance.now() + PHOTO_BUDGET_MS;
+  const total = detector ? 9 : 8;
+  let step = 0;
+
   const report = (label) => {
+    step++;
     if (typeof onProgress === 'function') {
-      try { onProgress(label); } catch { /* ignore */ }
+      try {
+        onProgress({ step, total, label });
+      } catch { /* ignore */ }
     }
   };
 
-  // 阶段 1：原生 BarcodeDetector 满分辨率快速预检
-  report('正在快速预检原图…');
-  const detector = await getBarcodeDetector();
   if (detector) {
+    report('正在快速预检原图…');
     try {
       const codes = await detector.detect(source);
+      throwIfAborted(signal);
       if (codes && codes.length > 0 && codes[0].rawValue) {
         return codes[0].rawValue.trim();
       }
-    } catch { /* continue */ }
+    } catch (err) {
+      if (err && err.name === 'AbortError') throw err;
+    }
+    await yieldToMain(signal);
   }
 
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-  // 阶段 2：全图 1800px 标准通道
-  report('正在解析高清原图…');
-  drawRegion(canvas, ctx, source, 0, 0, srcW, srcH, 1800);
-  let text = await decodeCanvas(canvas, ctx, { mode: 'fast', useBarcodeDetector: false });
-  if (text) return text;
-
-  // 阶段 3：1:1 原分辨率中心 60% 与 35% 裁剪
-  report('正在精扫中心区域…');
-  for (const [ratio, minDim] of [[0.60, 0], [0.35, 480]]) {
-    const cw = srcW * ratio;
-    const ch = srcH * ratio;
-    const cx = (srcW - cw) / 2;
-    const cy = (srcH - ch) / 2;
-    drawRegion(canvas, ctx, source, cx, cy, cw, ch, 1400, minDim);
-    text = await decodeCanvas(canvas, ctx, { mode: 'fast', useBarcodeDetector: false });
-    if (text) return text;
-  }
-
-  // 阶段 4：原分辨率 3x3 重叠网格切块（45% 宽×高，步进 27.5%，上限 1000px）
-  report('正在分区扫描…');
-  const tileW = srcW * 0.45;
-  const tileH = srcH * 0.45;
-  const stepX = srcW * 0.275;
-  const stepY = srcH * 0.275;
-  for (const [col, row] of TILE_ORDER) {
-    const sx = Math.min(srcW - tileW, Math.max(0, col * stepX));
-    const sy = Math.min(srcH - tileH, Math.max(0, row * stepY));
-    drawRegion(canvas, ctx, source, sx, sy, tileW, tileH, 1000);
-    text = await decodeCanvas(canvas, ctx, { mode: 'fast', useBarcodeDetector: false });
-    if (text) return text;
-  }
-
-  // 阶段 5：图像增强通道（2%-98% 对比度拉伸 + 3x3 锐化 + tryDenoise + GlobalHistogram）
-  report('正在增强对比度识别…');
-  for (const [ratio, minDim] of [[0.55, 0], [0.35, 480]]) {
-    const cw = srcW * ratio;
-    const ch = srcH * ratio;
-    const cx = (srcW - cw) / 2;
-    const cy = (srcH - ch) / 2;
-    drawRegion(canvas, ctx, source, cx, cy, cw, ch, 960, minDim);
-    text = await decodeCanvas(canvas, ctx, { mode: 'enhanced', useBarcodeDetector: false });
-    if (text) return text;
-  }
-
-  return '';
-}
-
-export async function decodeImageFile(file, { onProgress } = {}) {
-  if (!file) throw new Error('未选择图片');
-  let source = null;
-  let revokeUrl = '';
-  let bitmap = null;
+  const stages = [
+    { label: '正在解析高清原图…', sx: 0, sy: 0, sw: srcW, sh: srcH, maxDim: 1400, minDim: 0, profile: 'photo-fast' },
+    {
+      label: '正在精扫中心区域…',
+      sx: srcW * 0.225,
+      sy: srcH * 0.225,
+      sw: srcW * 0.55,
+      sh: srcH * 0.55,
+      maxDim: 960,
+      minDim: 0,
+      profile: 'photo-fast',
+    },
+    {
+      label: '正在精扫中心特写…',
+      sx: srcW * 0.325,
+      sy: srcH * 0.325,
+      sw: srcW * 0.35,
+      sh: srcH * 0.35,
+      maxDim: 960,
+      minDim: 480,
+      profile: 'photo-fast',
+    },
+    ...QUADRANTS.map(([ox, oy]) => ({
+      label: '正在分区扫描…',
+      sx: srcW * ox,
+      sy: srcH * oy,
+      sw: srcW * 0.6,
+      sh: srcH * 0.6,
+      maxDim: 960,
+      minDim: 0,
+      profile: 'photo-fast',
+    })),
+    {
+      label: '正在增强对比度识别…',
+      sx: srcW * 0.25,
+      sy: srcH * 0.25,
+      sw: srcW * 0.5,
+      sh: srcH * 0.5,
+      maxDim: 800,
+      minDim: 0,
+      profile: 'photo-enhanced',
+    },
+  ];
 
   try {
-    if (typeof createImageBitmap === 'function') {
-      try {
-        bitmap = await createImageBitmap(file);
-        source = bitmap;
-      } catch { /* fallback to Image */ }
-    }
-    if (!source) {
-      revokeUrl = URL.createObjectURL(file);
-      source = await loadImageElement(revokeUrl);
-    }
+    for (let i = 0; i < stages.length; i++) {
+      throwIfAborted(signal);
+      if (i > 0 && performance.now() >= deadline) break;
 
-    const srcW = source.naturalWidth || source.width;
-    const srcH = source.naturalHeight || source.height;
-    if (!srcW || !srcH) throw new Error('图片尺寸无效');
+      const st = stages[i];
+      report(st.label);
+      drawRegion(canvas, ctx, source, st.sx, st.sy, st.sw, st.sh, st.maxDim, st.minDim);
+      const text = await decodeCanvasWithWorker(canvas, ctx, st.profile, signal);
+      if (text) return text;
 
-    const text = await decodeSourceFiveStage(source, srcW, srcH, { onProgress });
+      if (i < stages.length - 1) {
+        await yieldToMain(signal);
+      }
+    }
+    return '';
+  } finally {
+    zeroCanvas(canvas);
+  }
+}
+
+export async function decodeImageFile(file, { signal, onProgress } = {}) {
+  throwIfAborted(signal);
+  if (!file) throw new Error('未选择图片');
+
+  const loaded = await loadCappedImageSource(file, signal);
+  try {
+    const text = await decodeSourceBudgeted(loaded.source, loaded.width, loaded.height, {
+      signal,
+      onProgress,
+    });
+    throwIfAborted(signal);
     if (!text) throw new Error('未在图片中识别到二维码，请对准清晰二维码重试');
     return text;
   } finally {
-    if (bitmap && typeof bitmap.close === 'function') bitmap.close();
-    if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+    loaded.release();
+    workerClient.sendReset();
   }
 }
 
@@ -359,17 +616,35 @@ function touchDistance(t1, t2) {
   return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
 }
 
-export function openCameraScanner({ onResult, onPickFile }) {
+export function openCameraScanner({ onResult, onPickFile, onClose } = {}) {
+  if (activeCameraScanner) {
+    activeCameraScanner.close();
+  }
+
+  workerClient.resetRestarts();
+
+  let state = 'starting';
+  let closeReason = 'user';
+  let onCloseFired = false;
+  let sessionAbort = new AbortController();
+  let captureAbort = null;
+  let startGen = 0;
+  let scanGen = 0;
+
   let stream = null;
   let videoTrack = null;
   let trackCaps = {};
   let imageCapture = null;
-  let closed = false;
-  let rafId = 0;
-  let lastScanAt = 0;
-  let workerBusy = false;
-  let shutterBusy = false;
+  let detector = null;
+  let workerReady = false;
+
+  let scanTimer = 0;
+  let vfcId = 0;
+  let frameBusy = false;
   let frameIndex = 0;
+  let enhancedToggle = false;
+  let lastDecodeMs = 120;
+  let intentionalTrackStop = false;
 
   let hasHwZoom = false;
   let hwZoomMin = 1;
@@ -382,6 +657,8 @@ export function openCameraScanner({ onResult, onPickFile }) {
   let lastHwZoomAt = 0;
   let torchOn = false;
   let focusTimer = 0;
+  let pinchTimer = 0;
+  let statusTimer = 0;
   let engineLabel = 'WASM 高清';
 
   let pinchStartDist = 0;
@@ -404,7 +681,7 @@ export function openCameraScanner({ onResult, onPickFile }) {
     'aria-pressed': 'false',
     onclick: async (e) => {
       e.stopPropagation();
-      if (!videoTrack || !trackCaps.torch) return;
+      if (!videoTrack || !trackCaps.torch || state === 'closed') return;
       const next = !torchOn;
       try {
         await videoTrack.applyConstraints({ advanced: [{ torch: next }] });
@@ -443,11 +720,21 @@ export function openCameraScanner({ onResult, onPickFile }) {
     onclick: () => { captureHighResFrame(); },
   }, icon('camera', 18), '高清拍一帧');
 
+  const retryBtn = h('button', {
+    type: 'button',
+    class: 'btn primary',
+    hidden: true,
+    onclick: () => { resume(); },
+  }, '重新开启相机');
+
   const stageEl = h('div', { class: 'scanner-stage' },
     video,
     frameEl,
     overlayTop,
     zoomBar);
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
   function updatePill() {
     const effective = currentHwZoom * currentDigitalZoom;
@@ -471,7 +758,7 @@ export function openCameraScanner({ onResult, onPickFile }) {
   }
 
   function flushHwZoom() {
-    if (!videoTrack || !hasHwZoom || closed) return;
+    if (!videoTrack || !hasHwZoom || state === 'closed' || state === 'paused') return;
     if (Math.abs(currentHwZoom - lastAppliedHwZoom) < 0.01) return;
     lastAppliedHwZoom = currentHwZoom;
     lastHwZoomAt = performance.now();
@@ -484,7 +771,6 @@ export function openCameraScanner({ onResult, onPickFile }) {
     currentHwZoom = hasHwZoom
       ? Math.min(hwZoomMax, Math.max(hwZoomMin, targetZoom))
       : 1;
-    // 离散化数字变焦倍率，使预览 CSS .zoom-* 与 1:1 传感器采样裁剪严格一致
     currentDigitalZoom = snapDigitalZoom(targetZoom / currentHwZoom);
 
     for (const cls of ZOOM_CLASS_LIST) video.classList.remove(cls);
@@ -510,25 +796,25 @@ export function openCameraScanner({ onResult, onPickFile }) {
 
   function triggerRefocus() {
     frameEl.classList.remove('focusing');
-    // Force reflow so rapid taps replay animation
     void frameEl.offsetWidth;
     frameEl.classList.add('focusing');
     clearTimeout(focusTimer);
-    focusTimer = setTimeout(() => frameEl.classList.remove('focusing'), 460);
+    focusTimer = setTimeout(() => {
+      focusTimer = 0;
+      frameEl.classList.remove('focusing');
+    }, 460);
 
     if (videoTrack && Array.isArray(trackCaps.focusMode) && trackCaps.focusMode.includes('continuous')) {
       videoTrack.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
     }
   }
 
-  // 点击舞台重新对焦
   stageEl.addEventListener('click', (e) => {
     if (isPinching) return;
     if (e.target && e.target.closest('button')) return;
     triggerRefocus();
   });
 
-  // 双指捏合缩放
   stageEl.addEventListener('touchstart', (e) => {
     if (e.touches.length === 2) {
       isPinching = true;
@@ -550,139 +836,189 @@ export function openCameraScanner({ onResult, onPickFile }) {
   stageEl.addEventListener('touchend', (e) => {
     if (e.touches.length < 2) {
       pinchStartDist = 0;
-      setTimeout(() => { isPinching = false; }, 120);
+      clearTimeout(pinchTimer);
+      pinchTimer = setTimeout(() => {
+        pinchTimer = 0;
+        isPinching = false;
+      }, 120);
     }
   }, { passive: true });
 
   stageEl.addEventListener('touchcancel', () => {
     pinchStartDist = 0;
+    clearTimeout(pinchTimer);
+    pinchTimer = 0;
     isPinching = false;
   }, { passive: true });
 
-  const stopCamera = () => {
-    closed = true;
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = 0;
+  function cancelScanSchedule() {
+    if (scanTimer) {
+      clearTimeout(scanTimer);
+      scanTimer = 0;
+    }
+    if (vfcId && typeof video.cancelVideoFrameCallback === 'function') {
+      try { video.cancelVideoFrameCallback(vfcId); } catch { /* ignore */ }
+      vfcId = 0;
+    }
+  }
+
+  function clearAllTimers() {
+    cancelScanSchedule();
     clearTimeout(zoomThrottleTimer);
+    zoomThrottleTimer = 0;
     clearTimeout(focusTimer);
-    if (videoTrack && torchOn) {
-      try { videoTrack.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {}); } catch { /* ignore */ }
-      torchOn = false;
+    focusTimer = 0;
+    clearTimeout(pinchTimer);
+    pinchTimer = 0;
+    clearTimeout(statusTimer);
+    statusTimer = 0;
+  }
+
+  function onTrackEnded() {
+    if (intentionalTrackStop || state === 'closed' || state === 'paused') return;
+    cancelScanSchedule();
+    scanGen++;
+    state = 'paused';
+    shutterBtn.disabled = true;
+    retryBtn.hidden = false;
+    pillEl.textContent = '相机已断开';
+    statusEl.textContent = '摄像头连接已中断，可点击「重新开启相机」或改用「相册」。';
+    zeroCanvas(canvas);
+  }
+
+  function stopTracks() {
+    intentionalTrackStop = true;
+    if (videoTrack) {
+      videoTrack.removeEventListener('ended', onTrackEnded);
+      if (torchOn) {
+        try { videoTrack.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {}); } catch { /* ignore */ }
+        torchOn = false;
+        torchBtn.setAttribute('aria-pressed', 'false');
+      }
     }
     if (stream) {
-      for (const track of stream.getTracks()) track.stop();
+      for (const track of stream.getTracks()) {
+        try { track.stop(); } catch { /* ignore */ }
+      }
       stream = null;
     }
     videoTrack = null;
+    trackCaps = {};
     imageCapture = null;
     video.srcObject = null;
-    terminateWorker();
-  };
+    zeroCanvas(canvas);
+    intentionalTrackStop = false;
+  }
+
+  function onVisibilityChange() {
+    if (state === 'closed') return;
+    if (document.visibilityState === 'hidden') {
+      pause();
+    } else if (document.visibilityState === 'visible' && state === 'paused') {
+      resume();
+    }
+  }
+
+  function cleanup() {
+    if (state === 'closed') return;
+    state = 'closed';
+    startGen++;
+    scanGen++;
+    sessionAbort.abort();
+    if (captureAbort) {
+      captureAbort.abort();
+      captureAbort = null;
+    }
+    clearAllTimers();
+    stopTracks();
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    if (activeCameraScanner === handle) {
+      activeCameraScanner = null;
+    }
+    workerClient.sendReset();
+    workerClient.scheduleIdleTerminate();
+    if (!onCloseFired) {
+      onCloseFired = true;
+      if (typeof onClose === 'function') {
+        try { onClose(closeReason); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  function closeWithReason(reason) {
+    if (state === 'closed') return;
+    closeReason = reason;
+    dlg.close();
+  }
 
   const content = h('div', { class: 'scanner-sheet' },
     h('div', { class: 'sheet-head' },
       h('h2', {}, '网页相机扫码'),
-      h('button', { type: 'button', class: 'icon-btn', 'aria-label': '关闭', onclick: () => dlg.close() }, icon('x'))),
+      h('button', {
+        type: 'button',
+        class: 'icon-btn',
+        'aria-label': '关闭',
+        onclick: () => closeWithReason('user'),
+      }, icon('x'))),
     stageEl,
     h('div', { class: 'scanner-foot' },
       statusEl,
       h('div', { class: 'scanner-actions' },
         shutterBtn,
+        retryBtn,
         h('button', {
           type: 'button',
           class: 'btn tonal',
           onclick: () => {
-            dlg.close();
+            closeWithReason('pick-file');
             if (typeof onPickFile === 'function') onPickFile();
           },
         }, icon('image', 18), '相册'),
         h('button', {
           type: 'button',
           class: 'btn ghost',
-          onclick: () => dlg.close(),
+          onclick: () => closeWithReason('user'),
         }, '关闭'))));
 
-  const dlg = openDialog(content, { label: '网页相机扫码', onClose: stopCamera });
-
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const dlg = openDialog(content, { label: '网页相机扫码', onClose: cleanup });
 
   function finishWithResult(text) {
-    if (!text || closed) return;
-    dlg.close();
+    if (!text || state === 'closed') return;
+    closeWithReason('result');
     if (typeof onResult === 'function') onResult(text);
   }
 
-  async function captureHighResFrame() {
-    if (closed || shutterBusy) return;
-    shutterBusy = true;
-    shutterBtn.disabled = true;
-    const prevStatus = statusEl.textContent;
-    statusEl.textContent = '正在拍摄高清原帧…';
-
-    try {
-      let text = '';
-      if (imageCapture && typeof imageCapture.takePhoto === 'function') {
-        try {
-          const blob = await imageCapture.takePhoto();
-          if (closed) return;
-          // 优先尝试 Worker 原图直传，未命中则走完整 5 阶段多 ROI 流水线
-          const workerOk = await ensureWorker();
-          if (workerOk) {
-            statusEl.textContent = '正在高清解析快门原图…';
-            const res = await sendWorkerRequest({ type: 'decode-blob', blob });
-            if (res && res.text) text = res.text;
-          }
-          if (!text && !closed) {
-            text = await decodeImageFile(blob, {
-              onProgress: (label) => {
-                if (!closed) statusEl.textContent = label;
-              },
-            }).catch(() => '');
-          }
-        } catch { /* fallback to full-res video frame */ }
-      }
-
-      if (!text && !closed && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
-        statusEl.textContent = '正在满分辨率精扫当前帧…';
-        text = await decodeSourceFiveStage(video, video.videoWidth, video.videoHeight, {
-          onProgress: (label) => {
-            if (!closed) statusEl.textContent = label;
-          },
+  function scheduleNextScan(delayMs) {
+    if (state !== 'scanning') return;
+    cancelScanSchedule();
+    const myGen = scanGen;
+    scanTimer = setTimeout(() => {
+      scanTimer = 0;
+      if (state !== 'scanning' || myGen !== scanGen) return;
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        vfcId = video.requestVideoFrameCallback(() => {
+          vfcId = 0;
+          if (state === 'scanning' && myGen === scanGen) runLiveFrame(myGen);
         });
+      } else {
+        runLiveFrame(myGen);
       }
-
-      if (text && !closed) {
-        finishWithResult(text);
-        return;
-      }
-      if (!closed) {
-        statusEl.textContent = '未识别到二维码，可拉近倍率或轻点屏幕对焦后重试';
-        setTimeout(() => {
-          if (!closed && !shutterBusy) statusEl.textContent = prevStatus;
-        }, 2200);
-      }
-    } catch {
-      if (!closed) statusEl.textContent = '高清拍帧失败，请继续对准或使用相册识码';
-    } finally {
-      shutterBusy = false;
-      if (!closed && videoTrack) shutterBtn.disabled = false;
-    }
+    }, delayMs);
   }
 
-  const loop = async (now) => {
-    if (closed) return;
-    rafId = requestAnimationFrame(loop);
-    if (workerBusy || shutterBusy || now - lastScanAt < 80) return;
-    if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+  async function runLiveFrame(myGen) {
+    if (state !== 'scanning' || myGen !== scanGen) return;
+    if (frameBusy || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+      scheduleNextScan(120);
+      return;
+    }
 
-    workerBusy = true;
-    lastScanAt = now;
+    frameBusy = true;
+    const t0 = performance.now();
 
     try {
       const vw = video.videoWidth;
       const vh = video.videoHeight;
-      // 1:1 传感器像素数字变焦视口（与 CSS .zoom-* 严格对齐）
       const viewW = vw / currentDigitalZoom;
       const viewH = vh / currentDigitalZoom;
       const viewX = (vw - viewW) / 2;
@@ -691,54 +1027,151 @@ export function openCameraScanner({ onResult, onPickFile }) {
       const slot = frameIndex % 4;
       frameIndex++;
 
-      let sx = viewX;
-      let sy = viewY;
-      let sw = viewW;
-      let sh = viewH;
-      let maxDim = 960;
-      let minDim = 0;
-      let mode = 'fast';
-      let useBarcodeDetector = true;
+      let text = '';
 
-      if (slot === 0) {
-        // 中心 60% ROI，原生 1:1 像素，上限 960px
-        sw = viewW * 0.60;
-        sh = viewH * 0.60;
-        sx = viewX + (viewW - sw) / 2;
-        sy = viewY + (viewH - sh) / 2;
-        maxDim = 960;
-      } else if (slot === 1) {
-        // 中心 35% 长焦 ROI，若边长 < 320px 则等比放大至 480px
-        sw = viewW * 0.35;
-        sh = viewH * 0.35;
-        sx = viewX + (viewW - sw) / 2;
-        sy = viewY + (viewH - sh) / 2;
-        maxDim = 960;
-        minDim = Math.max(sw, sh) < 320 ? 480 : 0;
-      } else if (slot === 2) {
-        // 完整视口，上限 1080px
-        maxDim = 1080;
-      } else {
-        // 中心 50% ROI，上限 720px，Worker 对比度拉伸 + 锐化增强模式
-        sw = viewW * 0.50;
-        sh = viewH * 0.50;
-        sx = viewX + (viewW - sw) / 2;
-        sy = viewY + (viewH - sh) / 2;
-        maxDim = 720;
-        mode = 'enhanced';
-        useBarcodeDetector = false;
+      if (slot === 0 && detector) {
+        // 仅跑原生 BarcodeDetector（直接读 <video>，零 canvas 拷贝），绝不与 WASM 同帧并行
+        try {
+          const codes = await detector.detect(video);
+          if (codes && codes.length > 0 && codes[0].rawValue) {
+            text = codes[0].rawValue.trim();
+          }
+        } catch { /* ignore */ }
+      } else if (workerReady) {
+        let sx = viewX;
+        let sy = viewY;
+        let sw = viewW;
+        let sh = viewH;
+        let maxDim = 960;
+        let minDim = 0;
+        let profile = 'live-fast';
+
+        if (slot === 0) {
+          maxDim = 960;
+        } else if (slot === 1) {
+          sw = viewW * 0.55;
+          sh = viewH * 0.55;
+          sx = viewX + (viewW - sw) / 2;
+          sy = viewY + (viewH - sh) / 2;
+          maxDim = 800;
+        } else if (slot === 2) {
+          sw = viewW * 0.35;
+          sh = viewH * 0.35;
+          sx = viewX + (viewW - sw) / 2;
+          sy = viewY + (viewH - sh) / 2;
+          maxDim = 720;
+          minDim = Math.max(sw, sh) < 320 ? 480 : 0;
+        } else {
+          sw = viewW * 0.5;
+          sh = viewH * 0.5;
+          sx = viewX + (viewW - sw) / 2;
+          sy = viewY + (viewH - sh) / 2;
+          maxDim = 640;
+          enhancedToggle = !enhancedToggle;
+          profile = enhancedToggle ? 'live-enhanced-local' : 'live-enhanced-global';
+        }
+
+        drawRegion(canvas, ctx, video, sx, sy, sw, sh, maxDim, minDim);
+        text = await decodeCanvasWithWorker(canvas, ctx, profile, sessionAbort.signal);
       }
 
-      drawRegion(canvas, ctx, video, sx, sy, sw, sh, maxDim, minDim);
-      const text = await decodeCanvas(canvas, ctx, { mode, useBarcodeDetector });
-      if (text && !closed) {
+      if (text && state === 'scanning' && myGen === scanGen) {
         finishWithResult(text);
         return;
       }
-    } catch { /* continue scanning */ } finally {
-      workerBusy = false;
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+    } finally {
+      frameBusy = false;
+      lastDecodeMs = Math.max(1, performance.now() - t0);
     }
-  };
+
+    if (state === 'scanning' && myGen === scanGen) {
+      const nextDelay = Math.max(120, Math.min(400, Math.round(lastDecodeMs * 1.5)));
+      scheduleNextScan(nextDelay);
+    }
+  }
+
+  async function captureHighResFrame() {
+    if (state !== 'scanning') return;
+    state = 'capturing';
+    cancelScanSchedule();
+    scanGen++;
+    shutterBtn.disabled = true;
+    clearTimeout(statusTimer);
+    statusTimer = 0;
+
+    captureAbort = new AbortController();
+    const sig = captureAbort.signal;
+    const prevStatus = statusEl.textContent;
+    statusEl.textContent = '正在拍摄高清原帧…';
+
+    try {
+      let text = '';
+      let takePhotoFailed = false;
+
+      if (imageCapture && typeof imageCapture.takePhoto === 'function') {
+        try {
+          const blob = await imageCapture.takePhoto();
+          throwIfAborted(sig);
+          if (state !== 'capturing') return;
+          text = await decodeImageFile(blob, {
+            signal: sig,
+            onProgress: (p) => {
+              if (state === 'capturing') statusEl.textContent = p.label;
+            },
+          }).catch((err) => {
+            if (err && err.name === 'AbortError') throw err;
+            return '';
+          });
+        } catch (err) {
+          if (err && err.name === 'AbortError') return;
+          takePhotoFailed = true;
+        }
+      } else {
+        takePhotoFailed = true;
+      }
+
+      // 仅当 takePhoto 不可用或抛错时，回退到当前视频帧的预算式解码
+      if (takePhotoFailed && !text && state === 'capturing' && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+        statusEl.textContent = '正在精扫当前高清帧…';
+        text = await decodeSourceBudgeted(video, video.videoWidth, video.videoHeight, {
+          signal: sig,
+          onProgress: (p) => {
+            if (state === 'capturing') statusEl.textContent = p.label;
+          },
+        }).catch((err) => {
+          if (err && err.name === 'AbortError') throw err;
+          return '';
+        });
+      }
+
+      if (text && state === 'capturing') {
+        finishWithResult(text);
+        return;
+      }
+
+      if (state === 'capturing') {
+        statusEl.textContent = '未识别到二维码，可拉近倍率或轻点屏幕对焦后重试';
+        statusTimer = setTimeout(() => {
+          statusTimer = 0;
+          if (state === 'scanning') statusEl.textContent = prevStatus;
+        }, 2200);
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      if (state === 'capturing') {
+        statusEl.textContent = '高清拍帧失败，请继续对准或使用相册识码';
+      }
+    } finally {
+      captureAbort = null;
+      if (state === 'capturing') {
+        state = 'scanning';
+        if (videoTrack) shutterBtn.disabled = false;
+        scheduleNextScan(150);
+      }
+    }
+  }
 
   async function requestCameraStream() {
     try {
@@ -762,45 +1195,73 @@ export function openCameraScanner({ onResult, onPickFile }) {
     }
   }
 
-  (async () => {
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+  async function startCamera() {
+    const myStartGen = ++startGen;
+    state = 'starting';
+    retryBtn.hidden = true;
+    shutterBtn.disabled = true;
+
+    const support = getScannerSupport();
+    if (!support.camera) {
       pillEl.textContent = '不支持相机';
       statusEl.textContent = '当前环境不支持网页摄像头（需 HTTPS），请改用下方「相册」。';
       return;
     }
+
+    if (!support.barcodeDetector && !support.wasmWorker) {
+      pillEl.textContent = '不支持解码';
+      statusEl.textContent = '当前浏览器不支持二维码解码，请改用现代浏览器或系统相机。';
+      return;
+    }
+
+    statusEl.textContent = '正在请求高清后置摄像头…';
+
+    let mediaStream = null;
     try {
-      // 并行预热解码引擎与请求相机流
-      const [workerOk, detector, mediaStream] = await Promise.all([
-        ensureWorker(),
+      const [wOk, det, acquired] = await Promise.all([
+        workerClient.ensureReady(sessionAbort.signal).catch(() => false),
         getBarcodeDetector(),
         requestCameraStream(),
       ]);
+      mediaStream = acquired;
 
-      if (closed) {
+      if (state === 'closed' || sessionAbort.signal.aborted || myStartGen !== startGen) {
         for (const t of mediaStream.getTracks()) t.stop();
         return;
       }
 
+      workerReady = wOk;
+      detector = det;
       stream = mediaStream;
-      if (workerOk) {
+      mediaStream = null;
+
+      if (workerReady) {
         engineLabel = detector ? '原生+WASM' : 'WASM 高清';
+      } else if (detector) {
+        engineLabel = '原生引擎';
       } else {
-        engineLabel = detector ? '原生+兼容' : '兼容模式';
-        if (!detector) {
-          statusEl.textContent = '正在加载兼容二维码解码器…';
-          await ensureJsQR();
-        }
-      }
-      if (closed) {
-        stopCamera();
+        engineLabel = '解码不可用';
+        statusEl.textContent = '解码引擎初始化失败，请刷新重试或改用「相册」。';
+        stopTracks();
         return;
       }
 
       video.srcObject = stream;
       await video.play();
 
+      if (state === 'closed' || sessionAbort.signal.aborted || myStartGen !== startGen) {
+        stopTracks();
+        return;
+      }
+
       videoTrack = stream.getVideoTracks()[0] || null;
+      hasHwZoom = false;
+      hwZoomMin = 1;
+      hwZoomMax = 1;
+      torchBtn.hidden = true;
+
       if (videoTrack) {
+        videoTrack.addEventListener('ended', onTrackEnded);
         if (typeof videoTrack.getCapabilities === 'function') {
           try { trackCaps = videoTrack.getCapabilities() || {}; } catch { trackCaps = {}; }
         }
@@ -821,18 +1282,61 @@ export function openCameraScanner({ onResult, onPickFile }) {
         shutterBtn.disabled = false;
       }
 
-      applyZoom(1);
+      applyZoom(targetZoom);
+      state = 'scanning';
       statusEl.textContent = '对准教室大屏二维码，支持双指缩放与点击对焦';
-      rafId = requestAnimationFrame(loop);
+      scheduleNextScan(120);
     } catch (err) {
-      if (closed) return;
+      if (mediaStream) {
+        for (const t of mediaStream.getTracks()) t.stop();
+      }
+      if (state === 'closed' || (err && err.name === 'AbortError') || myStartGen !== startGen) return;
       pillEl.textContent = '相机受限';
       const msg = err && err.name === 'NotAllowedError'
         ? '未授予摄像头权限，请在浏览器设置中允许或使用「相册」。'
         : `无法打开摄像头（${(err && err.message) || '权限受限'}），可改用「相册」。`;
       statusEl.textContent = msg;
+      retryBtn.hidden = false;
     }
-  })();
+  }
 
-  return dlg;
+  function pause() {
+    if (state === 'closed' || state === 'paused') return;
+    state = 'paused';
+    startGen++;
+    scanGen++;
+    if (captureAbort) {
+      captureAbort.abort();
+      captureAbort = null;
+    }
+    clearAllTimers();
+    stopTracks();
+    shutterBtn.disabled = true;
+    pillEl.textContent = '已暂停';
+  }
+
+  async function resume() {
+    if (state === 'closed') return;
+    if (state === 'scanning' || state === 'starting') return;
+    if (sessionAbort.signal.aborted) {
+      sessionAbort = new AbortController();
+    }
+    await startCamera();
+  }
+
+  document.addEventListener('visibilitychange', onVisibilityChange);
+
+  const handle = {
+    get el() { return dlg.el; },
+    get state() { return state; },
+    pause,
+    resume,
+    close: () => closeWithReason('user'),
+    _closeWithReason: closeWithReason,
+  };
+
+  activeCameraScanner = handle;
+  startCamera();
+
+  return handle;
 }

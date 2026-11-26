@@ -35,7 +35,11 @@ const GF_LOG = new Uint8Array(256);
 
 const gfMul = (a, b) => (a === 0 || b === 0 ? 0 : GF_EXP[GF_LOG[a] + GF_LOG[b]]);
 
+const RS_GEN_CACHE = new Map();
+
 function rsGenerator(degree) {
+  const cached = RS_GEN_CACHE.get(degree);
+  if (cached) return cached;
   let poly = new Uint8Array([1]);
   for (let i = 0; i < degree; i++) {
     const next = new Uint8Array(poly.length + 1);
@@ -46,6 +50,7 @@ function rsGenerator(degree) {
     }
     poly = next;
   }
+  RS_GEN_CACHE.set(degree, poly);
   return poly;
 }
 
@@ -100,13 +105,13 @@ function encodeBits(bytes) {
   const ecBlocks = [];
   let off = 0;
   for (let i = 0; i < g1; i++) {
-    const blk = dataCW.slice(off, off + d1);
+    const blk = dataCW.subarray(off, off + d1);
     off += d1;
     dataBlocks.push(blk);
     ecBlocks.push(rsRemainder(blk, ecLen));
   }
   for (let i = 0; i < g2; i++) {
-    const blk = dataCW.slice(off, off + d2);
+    const blk = dataCW.subarray(off, off + d2);
     off += d2;
     dataBlocks.push(blk);
     ecBlocks.push(rsRemainder(blk, ecLen));
@@ -144,13 +149,14 @@ function bchVersion(ver) {
 
 function buildBaseMatrix(ver) {
   const size = 17 + 4 * ver;
-  const grid = Array.from({ length: size }, () => new Int8Array(size).fill(-1));
-  const fixed = Array.from({ length: size }, () => new Uint8Array(size));
+  const grid = new Uint8Array(size * size);
+  const fixed = new Uint8Array(size * size);
 
   const set = (r, c, v) => {
     if (r < 0 || c < 0 || r >= size || c >= size) return;
-    grid[r][c] = v ? 1 : 0;
-    fixed[r][c] = 1;
+    const idx = r * size + c;
+    grid[idx] = v ? 1 : 0;
+    fixed[idx] = 1;
   };
 
   const finder = (r0, c0) => {
@@ -174,7 +180,7 @@ function buildBaseMatrix(ver) {
   const align = VERSIONS[ver][6];
   for (const ar of align) {
     for (const ac of align) {
-      if (fixed[ar][ac]) continue;
+      if (fixed[ar * size + ac]) continue;
       for (let dr = -2; dr <= 2; dr++) {
         for (let dc = -2; dc <= 2; dc++) {
           const dark = Math.abs(dr) === 2 || Math.abs(dc) === 2 || (dr === 0 && dc === 0);
@@ -219,15 +225,17 @@ function placeData(size, grid, fixed, codewords) {
     if (col === 6) col--;
     for (let step = 0; step < size; step++) {
       const r = up ? size - 1 - step : step;
+      const rowOff = r * size;
       for (let dc = 0; dc < 2; dc++) {
         const c = col - dc;
-        if (fixed[r][c]) continue;
+        const idx = rowOff + c;
+        if (fixed[idx]) continue;
         let bit = 0;
         if (bitIdx < totalBits) {
           bit = (codewords[bitIdx >> 3] >> (7 - (bitIdx & 7))) & 1;
           bitIdx++;
         }
-        grid[r][c] = bit;
+        grid[idx] = bit;
       }
     }
     up = !up;
@@ -245,48 +253,84 @@ const MASK_FNS = [
   (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0,
 ];
 
-function applyMaskAndFormat(size, baseGrid, fixed, maskId) {
+function applyMaskAndFormatInto(out, size, baseGrid, fixed, maskId) {
   const fn = MASK_FNS[maskId];
-  const m = baseGrid.map((row, r) => row.map((v, c) => (fixed[r][c] ? v : v ^ (fn(r, c) ? 1 : 0))));
+  for (let r = 0; r < size; r++) {
+    const rowOff = r * size;
+    for (let c = 0; c < size; c++) {
+      const idx = rowOff + c;
+      const v = baseGrid[idx];
+      out[idx] = fixed[idx] ? v : (v ^ (fn(r, c) ? 1 : 0));
+    }
+  }
   const fmt = bchFormat(0b01, maskId);
   for (let k = 0; k < 15; k++) {
     const bit = (fmt >> (14 - k)) & 1;
-    if (k < 6) m[8][k] = bit;
-    else if (k < 8) m[8][k + 1] = bit;
-    else if (k === 8) m[7][8] = bit;
-    else m[14 - k][8] = bit;
+    if (k < 6) out[8 * size + k] = bit;
+    else if (k < 8) out[8 * size + (k + 1)] = bit;
+    else if (k === 8) out[7 * size + 8] = bit;
+    else out[(14 - k) * size + 8] = bit;
 
-    if (k < 7) m[size - 1 - k][8] = bit;
-    else m[8][size - 15 + k] = bit;
+    if (k < 7) out[(size - 1 - k) * size + 8] = bit;
+    else out[8 * size + (size - 15 + k)] = bit;
   }
-  m[size - 8][8] = 1;
-  return m;
+  out[(size - 8) * size + 8] = 1;
 }
 
-function penalty(m) {
-  const n = m.length;
+// ISO/IEC 18004 Rule 3 bitmasks (11-bit sliding window):
+// 10111010000 (0x5d0) and 00001011101 (0x05d)
+const RULE3_A = 0b10111010000;
+const RULE3_B = 0b00001011101;
+const RULE3_MASK = 0x7ff;
+
+function penalty(m, n) {
   let score = 0;
+
+  // Rule 1 (runs >= 5) + Rule 3 (1:1:3:1:1 finder-like patterns) in one row/col pass
   for (let r = 0; r < n; r++) {
-    let runC = 1;
-    let runR = 1;
+    const rowOff = r * n;
+    let runH = 1;
+    let runV = 1;
+    let winH = m[rowOff];
+    let winV = m[r];
     for (let i = 1; i < n; i++) {
-      if (m[r][i] === m[r][i - 1]) runC++;
-      else { if (runC >= 5) score += runC - 2; runC = 1; }
-      if (m[i][r] === m[i - 1][r]) runR++;
-      else { if (runR >= 5) score += runR - 2; runR = 1; }
+      const ch = m[rowOff + i];
+      if (ch === m[rowOff + i - 1]) runH++;
+      else {
+        if (runH >= 5) score += runH - 2;
+        runH = 1;
+      }
+      winH = ((winH << 1) | ch) & RULE3_MASK;
+      if (i >= 10 && (winH === RULE3_A || winH === RULE3_B)) score += 40;
+
+      const cv = m[i * n + r];
+      if (cv === m[(i - 1) * n + r]) runV++;
+      else {
+        if (runV >= 5) score += runV - 2;
+        runV = 1;
+      }
+      winV = ((winV << 1) | cv) & RULE3_MASK;
+      if (i >= 10 && (winV === RULE3_A || winV === RULE3_B)) score += 40;
     }
-    if (runC >= 5) score += runC - 2;
-    if (runR >= 5) score += runR - 2;
+    if (runH >= 5) score += runH - 2;
+    if (runV >= 5) score += runV - 2;
   }
+
+  // Rule 2: 2x2 same-color blocks
   for (let r = 0; r < n - 1; r++) {
+    const row0 = r * n;
+    const row1 = row0 + n;
     for (let c = 0; c < n - 1; c++) {
-      const s = m[r][c] + m[r][c + 1] + m[r + 1][c] + m[r + 1][c + 1];
+      const s = m[row0 + c] + m[row0 + c + 1] + m[row1 + c] + m[row1 + c + 1];
       if (s === 0 || s === 4) score += 3;
     }
   }
+
+  // Rule 4: dark module balance
   let dark = 0;
-  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) dark += m[r][c];
-  const pct = Math.abs((dark * 100) / (n * n) - 50);
+  const total = n * n;
+  for (let i = 0; i < total; i++) dark += m[i];
+  const pct = Math.abs((dark * 100) / total - 50);
   score += Math.floor(pct / 5) * 10;
   return score;
 }
@@ -297,22 +341,38 @@ export function makeQRMatrix(text) {
   const { size, grid, fixed } = buildBaseMatrix(ver);
   placeData(size, grid, fixed, codewords);
 
-  let best = null;
+  const work = new Uint8Array(size * size);
+  let bestId = 0;
   let bestScore = Infinity;
   for (let id = 0; id < 8; id++) {
-    const candidate = applyMaskAndFormat(size, grid, fixed, id);
-    const sc = penalty(candidate);
+    applyMaskAndFormatInto(work, size, grid, fixed, id);
+    const sc = penalty(work, size);
     if (sc < bestScore) {
       bestScore = sc;
-      best = candidate;
+      bestId = id;
     }
   }
-  return best;
+  applyMaskAndFormatInto(work, size, grid, fixed, bestId);
+  return { size, data: work };
 }
 
-export function renderQRDataURL(text, pxSize = 264) {
-  const matrix = makeQRMatrix(text);
-  const n = matrix.length;
+const QR_CACHE_MAX = 8;
+const qrCache = new Map();
+
+export function clearQRCache() {
+  qrCache.clear();
+}
+
+export function renderQRDataURL(text, pxSize = 260) {
+  const key = `${pxSize}:${text}`;
+  const cached = qrCache.get(key);
+  if (cached !== undefined) {
+    qrCache.delete(key);
+    qrCache.set(key, cached);
+    return cached;
+  }
+
+  const { size: n, data } = makeQRMatrix(text);
   const quiet = 4;
   const total = n + quiet * 2;
   const scale = Math.max(4, Math.floor(pxSize / total));
@@ -325,10 +385,26 @@ export function renderQRDataURL(text, pxSize = 264) {
   ctx.fillStyle = '#FFFFFF';
   ctx.fillRect(0, 0, dim, dim);
   ctx.fillStyle = '#182420';
+  ctx.beginPath();
   for (let r = 0; r < n; r++) {
+    const rowOff = r * n;
+    const py = (r + quiet) * scale;
     for (let c = 0; c < n; c++) {
-      if (matrix[r][c]) ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+      if (data[rowOff + c]) {
+        ctx.rect((c + quiet) * scale, py, scale, scale);
+      }
     }
   }
-  return canvas.toDataURL('image/png');
+  ctx.fill();
+
+  const url = canvas.toDataURL('image/png');
+  canvas.width = 0;
+  canvas.height = 0;
+
+  qrCache.set(key, url);
+  if (qrCache.size > QR_CACHE_MAX) {
+    const oldest = qrCache.keys().next().value;
+    qrCache.delete(oldest);
+  }
+  return url;
 }

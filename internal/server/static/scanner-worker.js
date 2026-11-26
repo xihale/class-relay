@@ -1,4 +1,4 @@
-// Classic Web Worker: self-hosted zxing-wasm@3.1.7 QR decoder + fast image enhancement kernel.
+// Classic Web Worker: self-hosted zxing-wasm@3.1.7 QR decoder + integer image enhancement kernel.
 // Zero external CDN requests: locateFile overrides WASM path to same-origin /vendor/zxing_reader.wasm.
 
 /* global importScripts, ZXingWASM, self */
@@ -9,35 +9,103 @@ importScripts('/vendor/zxing-reader.js');
 
 const WASM_URL = '/vendor/zxing_reader.wasm';
 
-const BASE_OPTIONS = {
-  formats: ['QRCode'],
-  tryHarder: true,
-  tryRotate: true,
-  tryInvert: true,
-  tryDownscale: true,
-  maxNumberOfSymbols: 1,
-  textMode: 'Plain',
-};
-
-const FAST_OPTIONS = {
-  ...BASE_OPTIONS,
-  tryDenoise: false,
-  binarizer: 'LocalAverage',
-};
-
-const ENHANCED_LOCAL_OPTIONS = {
-  ...BASE_OPTIONS,
-  tryDenoise: true,
-  binarizer: 'LocalAverage',
-};
-
-const ENHANCED_GLOBAL_OPTIONS = {
-  ...BASE_OPTIONS,
-  tryDenoise: false,
-  binarizer: 'GlobalHistogram',
+const PROFILES = {
+  'live-fast': {
+    enhance: false,
+    passes: [
+      {
+        formats: ['QRCode'],
+        tryHarder: false,
+        tryRotate: false,
+        tryInvert: false,
+        tryDownscale: false,
+        tryDenoise: false,
+        binarizer: 'LocalAverage',
+        maxNumberOfSymbols: 1,
+        textMode: 'Plain',
+      },
+    ],
+  },
+  'live-enhanced-local': {
+    enhance: true,
+    passes: [
+      {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: false,
+        tryInvert: true,
+        tryDownscale: false,
+        tryDenoise: true,
+        binarizer: 'LocalAverage',
+        maxNumberOfSymbols: 1,
+        textMode: 'Plain',
+      },
+    ],
+  },
+  'live-enhanced-global': {
+    enhance: true,
+    passes: [
+      {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: false,
+        tryInvert: true,
+        tryDownscale: false,
+        tryDenoise: false,
+        binarizer: 'GlobalHistogram',
+        maxNumberOfSymbols: 1,
+        textMode: 'Plain',
+      },
+    ],
+  },
+  'photo-fast': {
+    enhance: false,
+    passes: [
+      {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: false,
+        tryInvert: true,
+        tryDownscale: true,
+        tryDenoise: false,
+        binarizer: 'LocalAverage',
+        maxNumberOfSymbols: 1,
+        textMode: 'Plain',
+      },
+    ],
+  },
+  'photo-enhanced': {
+    enhance: true,
+    passes: [
+      {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: false,
+        tryInvert: true,
+        tryDownscale: true,
+        tryDenoise: true,
+        binarizer: 'LocalAverage',
+        maxNumberOfSymbols: 1,
+        textMode: 'Plain',
+      },
+      {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: false,
+        tryInvert: true,
+        tryDownscale: true,
+        tryDenoise: false,
+        binarizer: 'GlobalHistogram',
+        maxNumberOfSymbols: 1,
+        textMode: 'Plain',
+      },
+    ],
+  },
 };
 
 let initPromise = null;
+let scratchGray = null;
+let scratchHist = null;
 
 function ensureZXing() {
   if (!initPromise) {
@@ -46,19 +114,36 @@ function ensureZXing() {
         locateFile: (path) => (path.endsWith('.wasm') ? WASM_URL : path),
       },
       fireImmediately: true,
+    }).catch((err) => {
+      initPromise = null;
+      throw err;
     });
   }
   return initPromise;
 }
 
-// Fast in-place grayscale + 2%-98% percentile contrast stretch + 3x3 unsharp mask.
-// Designed for washed-out / slightly out-of-focus classroom projector QR codes.
+function resetScratch() {
+  scratchGray = null;
+  scratchHist = null;
+}
+
+// Fast in-place grayscale + 2%-98% percentile contrast stretch + integer fixed-point 3x3 unsharp mask.
+// Reuses module-level scratch buffers to eliminate per-frame allocations.
 function enhanceRgbaInPlace(rgba, width, height) {
   const n = width * height;
   if (n <= 0) return;
 
-  const gray = new Uint8Array(n);
-  const hist = new Uint32Array(256);
+  if (!scratchGray || scratchGray.length < n) {
+    scratchGray = new Uint8Array(n);
+  }
+  if (!scratchHist) {
+    scratchHist = new Uint32Array(256);
+  } else {
+    scratchHist.fill(0);
+  }
+
+  const gray = scratchGray;
+  const hist = scratchHist;
 
   for (let i = 0, p = 0; i < n; i++, p += 4) {
     const y = (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
@@ -66,8 +151,8 @@ function enhanceRgbaInPlace(rgba, width, height) {
     hist[y]++;
   }
 
-  const loTarget = Math.floor(n * 0.02);
-  const hiTarget = Math.ceil(n * 0.98);
+  const loTarget = (n * 2) / 100 | 0;
+  const hiTarget = ((n * 98 + 99) / 100) | 0;
   let acc = 0;
   let lo = 0;
   let hi = 255;
@@ -88,13 +173,20 @@ function enhanceRgbaInPlace(rgba, width, height) {
     }
   }
 
-  if (hi - lo >= 16) {
-    const scale = 255 / (hi - lo);
+  const range = hi - lo;
+  if (range >= 16) {
+    const scaleFP = ((255 << 16) / range) | 0;
     for (let i = 0; i < n; i++) {
-      let v = Math.round((gray[i] - lo) * scale);
-      if (v < 0) v = 0;
-      else if (v > 255) v = 255;
-      gray[i] = v;
+      const g = gray[i];
+      if (g <= lo) {
+        gray[i] = 0;
+      } else if (g >= hi) {
+        gray[i] = 255;
+      } else {
+        let v = ((g - lo) * scaleFP + 32768) >> 16;
+        if (v > 255) v = 255;
+        gray[i] = v;
+      }
     }
   }
 
@@ -109,8 +201,9 @@ function enhanceRgbaInPlace(rgba, width, height) {
           gray[idx - width - 1] + gray[idx - width] + gray[idx - width + 1] +
           gray[idx - 1]         + out               + gray[idx + 1] +
           gray[idx + width - 1] + gray[idx + width] + gray[idx + width + 1];
-        const blur = sum / 9;
-        out = Math.round(out + 1.2 * (out - blur));
+        // Fixed-point divide by 9: 7282 / 65536 ≈ 1 / 9; unsharp gain 19 / 16 ≈ 1.1875
+        const blur = (sum * 7282 + 32768) >> 16;
+        out = out + (((out - blur) * 19) >> 4);
         if (out < 0) out = 0;
         else if (out > 255) out = 255;
       }
@@ -136,34 +229,33 @@ function firstValidText(results) {
   return '';
 }
 
-async function decodeRgba(width, height, buffer, mode) {
+async function decodeRgba(width, height, buffer, profileName) {
+  if (
+    !Number.isInteger(width) ||
+    !Number.isInteger(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    !(buffer instanceof ArrayBuffer) ||
+    buffer.byteLength !== width * height * 4
+  ) {
+    throw new Error('Invalid RGBA frame dimensions or buffer length');
+  }
+
+  const profile = PROFILES[profileName] || PROFILES['live-fast'];
   await ensureZXing();
-  if (!buffer || buffer.byteLength < width * height * 4) return '';
+
   const data = new Uint8ClampedArray(buffer);
   const input = { data, width, height };
 
-  if (mode === 'enhanced') {
+  if (profile.enhance) {
     enhanceRgbaInPlace(data, width, height);
-    let text = firstValidText(await ZXingWASM.readBarcodes(input, ENHANCED_LOCAL_OPTIONS));
-    if (!text) {
-      text = firstValidText(await ZXingWASM.readBarcodes(input, ENHANCED_GLOBAL_OPTIONS));
-    }
-    return text;
   }
 
-  return firstValidText(await ZXingWASM.readBarcodes(input, FAST_OPTIONS));
-}
-
-async function decodeBlob(blob) {
-  await ensureZXing();
-  let text = firstValidText(await ZXingWASM.readBarcodes(blob, FAST_OPTIONS));
-  if (!text) {
-    text = firstValidText(await ZXingWASM.readBarcodes(blob, ENHANCED_LOCAL_OPTIONS));
+  for (let i = 0; i < profile.passes.length; i++) {
+    const text = firstValidText(await ZXingWASM.readBarcodes(input, profile.passes[i]));
+    if (text) return text;
   }
-  if (!text) {
-    text = firstValidText(await ZXingWASM.readBarcodes(blob, ENHANCED_GLOBAL_OPTIONS));
-  }
-  return text;
+  return '';
 }
 
 self.onmessage = async (event) => {
@@ -183,21 +275,22 @@ self.onmessage = async (event) => {
       return;
     }
 
-    if (type === 'decode-rgba') {
-      const text = await decodeRgba(msg.width, msg.height, msg.buffer, msg.mode || 'fast');
+    if (type === 'reset') {
+      resetScratch();
       self.postMessage({
         id,
-        text,
-        engine: 'zxing-wasm',
+        ok: true,
         elapsedMs: Math.round(performance.now() - t0),
       });
       return;
     }
 
-    if (type === 'decode-blob') {
-      const text = await decodeBlob(msg.blob);
+    if (type === 'decode-rgba') {
+      const profile = msg.profile || 'live-fast';
+      const text = await decodeRgba(msg.width, msg.height, msg.buffer, profile);
       self.postMessage({
         id,
+        ok: true,
         text,
         engine: 'zxing-wasm',
         elapsedMs: Math.round(performance.now() - t0),
