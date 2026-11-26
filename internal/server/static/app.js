@@ -3,7 +3,13 @@
 import { loadTheme, applyTheme } from './theme.js';
 import { h, clear, icon, toast, openDialog } from './dom.js';
 import { renderQRDataURL } from './qr.js';
-import { extractUrl, decodeImageFile, openCameraScanner } from './scanner.js';
+import {
+  extractUrl,
+  getScannerSupport,
+  decodeImageFile,
+  openCameraScanner,
+  disposeScannerResources,
+} from './scanner.js';
 
 const ROOM_RE = /^[A-Za-z0-9_-]{3,32}$/;
 const STORAGE_ROOM = 'class-relay-room';
@@ -14,9 +20,12 @@ const STORAGE_TTL = 'class-relay-ttl';
 const STORAGE_PRESETS = 'class-relay-prewarm-v1';
 const STORAGE_WARMED = 'class-relay-warmed-v1';
 const SESSION_REDIRECTED = 'class-relay-redirected';
+const MAX_REDIRECTED_KEYS = 12;
 
 const SOURCES = ['微助教', '雨课堂', '普通链接'];
 const TTLS = [60, 90, 180];
+const BACKOFF_MS = [1500, 3000, 6000, 10000];
+const REDIRECT_WATCHDOG_MS = 1200;
 
 const TEACHERMATE_OAUTH_URL = 'https://open.weixin.qq.com/connect/oauth2/authorize?appid=wxa153455f3ef1d9f9&redirect_uri=https%3A%2F%2Fv18.teachermate.cn%2Fapi%2Fv1%2Fwechat%2Fr%3Fm%3Ds_signin&response_type=code&scope=snsapi_base&state=#wechat_redirect';
 
@@ -24,6 +33,8 @@ const DEFAULT_PRESETS = [
   { id: 'teachermate', name: '微助教', note: '微信静默授权并预热学生签到页', url: TEACHERMATE_OAUTH_URL },
   { id: 'custom', name: '自定义入口', note: '绑定课程或学校统一认证首页', url: '' },
 ];
+
+const NON_TAP_JUMP_SELECTOR = 'button, a, input, textarea, [role="switch"], .room-bar, .mode-switch';
 
 function safeReadJSON(storage, key, fallback) {
   try {
@@ -36,6 +47,10 @@ function safeReadJSON(storage, key, fallback) {
 
 function safeWriteJSON(storage, key, val) {
   try { storage.setItem(key, JSON.stringify(val)); } catch { /* ignore */ }
+}
+
+function hasDocumentFocus() {
+  return typeof document.hasFocus === 'function' ? document.hasFocus() : true;
 }
 
 function initialRoom() {
@@ -111,12 +126,14 @@ function savePresets(list) {
 }
 
 function loadWarmed() {
-  return safeReadJSON(localStorage, STORAGE_WARMED, {});
+  const raw = safeReadJSON(localStorage, STORAGE_WARMED, {});
+  return raw && typeof raw === 'object' ? raw : {};
 }
 
 function recordWarmed(preset) {
-  const warmed = loadWarmed();
+  const warmed = { ...state.warmed };
   warmed[preset.id] = { name: preset.name, at: Date.now() };
+  state.warmed = warmed;
   safeWriteJSON(localStorage, STORAGE_WARMED, warmed);
 }
 
@@ -132,7 +149,7 @@ function formatAgo(ms) {
 function latestWarmedSummary(warmed) {
   let latest = null;
   const activeIds = new Set(DEFAULT_PRESETS.map((p) => p.id));
-  for (const [id, item] of Object.entries(warmed)) {
+  for (const [id, item] of Object.entries(warmed || {})) {
     if (!activeIds.has(id)) continue;
     if (item && typeof item.at === 'number' && (!latest || item.at > latest.at)) {
       latest = item;
@@ -186,36 +203,86 @@ function buildShareUrl(room, mode) {
   return url.toString();
 }
 
+function remainSeconds(expiresAtLocal) {
+  return Math.max(0, Math.ceil((expiresAtLocal - Date.now()) / 1000));
+}
+
+// ---------- 应用状态 ----------
+
 const initRoomVal = initialRoom();
+const initOnline = typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+
 const state = {
   room: initRoomVal,
   roomDraft: initRoomVal,
+  roomBarExpanded: false,
   mode: initialMode(), // 'send' | 'recv'
   seq: 0,
   active: false,
   item: null,
   qrDataUrl: '',
   qrForUrl: '',
-  conn: 'connecting', // 'connecting' | 'live' | 'error'
+  online: initOnline,
+  conn: initOnline ? 'connecting' : 'offline', // 'connecting' | 'live' | 'error' | 'offline'
   autoRedirect: loadAutoRedirect(),
   presets: loadPresets(),
   warmed: loadWarmed(),
   redirectNotice: false,
+
+  // 微信焦点感知跳转状态机
+  isWeChat: /MicroMessenger/i.test(navigator.userAgent || ''),
+  visible: document.visibilityState === 'visible',
+  focused: hasDocumentFocus(),
+  pendingRedirect: null, // { key, seq, url, source, host, expiresAtLocal }
+  redirectStatus: 'idle', // 'idle' | 'navigating' | 'awaiting-focus' | 'blocked' | 'done'
+  redirectInFlightKey: null,
+  redirectWatchdog: 0,
+
+  // 轮询控制（单调代次防风暴）
+  pollGen: 0,
   pollAbort: null,
-  pollRunning: false,
+  retryAbort: null,
+  ttlTimer: 0,
+
+  // 发码端状态与扫码资源句柄
   senderUrl: '',
   senderSource: loadSource(),
   senderTtl: loadTtl(),
   senderBusy: false,
   senderProgress: '',
   senderError: '',
+  decodeAbort: null,
+  cameraHandle: null,
 };
 
-// 隐藏的图片选择器，供「拍照 / 相册识码」与摄像头弹窗兜底共用。
+// 持久化外壳与局部节点引用（避免全量销毁 DOM）
+const ui = {
+  mounted: false,
+  shell: null,
+  statusChip: null,
+  statusDot: null,
+  statusText: null,
+  roleSendBtn: null,
+  roleRecvBtn: null,
+  roomBar: null,
+  roomCodeText: null,
+  roomQuickCopyBtn: null,
+  roomToggleBtn: null,
+  roomDrawer: null,
+  roomInput: null,
+  mainSlot: null,
+  prewarmSlot: null,
+
+  // 主卡片缓存键与子引用
+  mainKey: '',
+  sender: null,
+  recv: null,
+};
+
+// 隐藏的图片选择器（不设 capture，允许用户同时选择相册或拍照）。
 const fileInput = h('input', {
   type: 'file',
   accept: 'image/*',
-  capture: 'environment',
   hidden: true,
   onchange: async () => {
     const file = fileInput.files && fileInput.files[0];
@@ -233,41 +300,207 @@ function syncUrl() {
   history.replaceState(null, '', url.toString());
 }
 
+// ---------- 跳转去重存储（有界 12 条 JSON 数组） ----------
+
 function redirectedKey(item) {
   return `${state.room}:${item.seq}:${item.url}`;
 }
 
-function hasRedirected(item) {
+function loadRedirectedKeys() {
   try {
-    return sessionStorage.getItem(SESSION_REDIRECTED) === redirectedKey(item);
+    const raw = sessionStorage.getItem(SESSION_REDIRECTED);
+    if (!raw) return [];
+    if (raw.startsWith('[')) {
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.filter((k) => typeof k === 'string') : [];
+    }
+    return [raw];
   } catch {
-    return false;
+    return [];
   }
 }
 
-function markRedirected(item) {
+function hasRedirectedKey(key) {
+  if (!key) return false;
+  return loadRedirectedKeys().includes(key);
+}
+
+function markRedirectedKey(key) {
+  if (!key) return;
   try {
-    sessionStorage.setItem(SESSION_REDIRECTED, redirectedKey(item));
+    const next = loadRedirectedKeys().filter((k) => k !== key);
+    next.push(key);
+    if (next.length > MAX_REDIRECTED_KEYS) {
+      next.splice(0, next.length - MAX_REDIRECTED_KEYS);
+    }
+    sessionStorage.setItem(SESSION_REDIRECTED, JSON.stringify(next));
   } catch { /* ignore */ }
+}
+
+function clearRedirectWatchdog() {
+  if (state.redirectWatchdog) {
+    clearTimeout(state.redirectWatchdog);
+    state.redirectWatchdog = 0;
+  }
+}
+
+function clearPendingRedirect() {
+  clearRedirectWatchdog();
+  state.pendingRedirect = null;
+  state.redirectInFlightKey = null;
+  state.redirectStatus = 'idle';
+  updateTapJumpClass();
+}
+
+function confirmInFlightRedirect() {
+  if (!state.redirectInFlightKey) return;
+  markRedirectedKey(state.redirectInFlightKey);
+  state.redirectInFlightKey = null;
+  state.redirectNotice = true;
+  state.redirectStatus = 'done';
+  clearRedirectWatchdog();
+}
+
+function isTapJumpArmed() {
+  return (
+    state.mode === 'recv' &&
+    Boolean(state.pendingRedirect) &&
+    (state.redirectStatus === 'awaiting-focus' || state.redirectStatus === 'blocked')
+  );
+}
+
+function updateTapJumpClass() {
+  if (ui.shell) {
+    ui.shell.classList.toggle('tap-jump-active', isTapJumpArmed());
+  }
+}
+
+// ---------- 微信焦点感知自动跳转执行器 ----------
+
+function tryExecutePendingRedirect({ fromGesture = false } = {}) {
+  const pending = state.pendingRedirect;
+  if (!pending) return false;
+
+  const valid =
+    state.mode === 'recv' &&
+    state.active &&
+    state.item &&
+    state.item.seq === pending.seq &&
+    pending.expiresAtLocal > Date.now() &&
+    !hasRedirectedKey(pending.key);
+
+  if (!valid) {
+    if (hasRedirectedKey(pending.key)) {
+      clearRedirectWatchdog();
+      state.pendingRedirect = null;
+      state.redirectInFlightKey = null;
+      state.redirectStatus = 'done';
+      state.redirectNotice = true;
+    } else {
+      clearPendingRedirect();
+    }
+    updateTapJumpClass();
+    updateRedirectPromptInPlace();
+    updateStatusChipInPlace();
+    return false;
+  }
+
+  // 防重入：已在跳转中且非用户显式手势，不重复发起。
+  if (state.redirectStatus === 'navigating' && !fromGesture) {
+    return false;
+  }
+
+  // 焦点门控：非手势触发且页面不可见或未获焦点时，不标记已跳转，改为醒目轻触提示。
+  if (!fromGesture) {
+    const canAuto = document.visibilityState === 'visible' && hasDocumentFocus();
+    if (!canAuto) {
+      state.redirectStatus = 'awaiting-focus';
+      ensureQR(pending.url);
+      updateTapJumpClass();
+      updateRedirectPromptInPlace();
+      updateRecvQrInPlace();
+      updateStatusChipInPlace();
+      return false;
+    }
+  }
+
+  clearRedirectWatchdog();
+  state.redirectInFlightKey = pending.key;
+  state.redirectStatus = 'navigating';
+  if (fromGesture) {
+    markRedirectedKey(pending.key);
+    state.redirectNotice = true;
+  }
+  updateTapJumpClass();
+  updateRedirectPromptInPlace();
+  updateStatusChipInPlace();
+
+  // 同步执行 location.assign（保留微信返回键历史，严禁 120ms 延迟与 location.replace）。
+  window.location.assign(pending.url);
+
+  // 1200ms 停滞看门狗：若仍停留在可见页，说明微信拦截或延迟了自动跳转。
+  const expectedKey = pending.key;
+  state.redirectWatchdog = setTimeout(() => {
+    state.redirectWatchdog = 0;
+    if (document.visibilityState === 'visible' && state.redirectInFlightKey === expectedKey) {
+      state.redirectInFlightKey = null;
+      state.redirectStatus = 'blocked';
+      ensureQR(pending.url);
+      updateTapJumpClass();
+      updateRedirectPromptInPlace();
+      updateRecvQrInPlace();
+      updateStatusChipInPlace();
+    }
+  }, REDIRECT_WATCHDOG_MS);
+
+  return true;
+}
+
+// ---------- 资源清理与切换 ----------
+
+function cleanupScannerInteraction() {
+  if (state.decodeAbort) {
+    state.decodeAbort.abort();
+    state.decodeAbort = null;
+  }
+  if (state.cameraHandle) {
+    const handle = state.cameraHandle;
+    state.cameraHandle = null;
+    try { handle.close(); } catch { /* ignore */ }
+  }
 }
 
 function setMode(nextMode) {
   if ((nextMode !== 'send' && nextMode !== 'recv') || nextMode === state.mode) return;
+  cleanupScannerInteraction();
+  if (nextMode !== 'recv') {
+    clearPendingRedirect();
+  }
   state.mode = nextMode;
   try { localStorage.setItem(STORAGE_MODE, nextMode); } catch { /* ignore */ }
   syncUrl();
-  render();
+  if (nextMode === 'recv' && state.active && state.item) {
+    ensureQR(state.item.url);
+  }
+  syncShell();
 }
 
 function setRoom(nextRoom) {
-  const trimmed = nextRoom.trim();
+  const trimmed = String(nextRoom || '').trim();
   if (!ROOM_RE.test(trimmed)) {
     toast('房间口令需为 3–32 位字母、数字、_ 或 -');
     return false;
   }
   state.roomDraft = trimmed;
-  if (trimmed === state.room) return true;
+  if (trimmed === state.room) {
+    state.roomBarExpanded = false;
+    updateRoomBarInPlace();
+    return true;
+  }
+  cleanupScannerInteraction();
+  clearPendingRedirect();
   state.room = trimmed;
+  state.roomBarExpanded = false;
   state.seq = 0;
   state.active = false;
   state.item = null;
@@ -276,13 +509,15 @@ function setRoom(nextRoom) {
   state.redirectNotice = false;
   try { localStorage.setItem(STORAGE_ROOM, trimmed); } catch { /* ignore */ }
   syncUrl();
+  syncTtlTimer();
+  syncShell();
   restartPolling();
-  render();
   toast(`已切换到房间 ${trimmed}`);
   return true;
 }
 
 function ensureQR(url) {
+  if (!url || state.mode !== 'recv') return '';
   if (state.qrForUrl === url && state.qrDataUrl) return state.qrDataUrl;
   try {
     state.qrDataUrl = renderQRDataURL(url, 260);
@@ -294,32 +529,71 @@ function ensureQR(url) {
   return state.qrDataUrl;
 }
 
-function updateStatusChipInPlace() {
-  const chip = document.getElementById('relay-status-chip');
-  if (!chip) return false;
-  const dot = chip.querySelector('.relay-dot');
-  const txt = chip.querySelector('.relay-status-text');
-  if (!dot || !txt) return false;
-  const dotCls = state.active ? 'active' : state.conn === 'live' ? 'live' : state.conn === 'error' ? 'err' : '';
-  dot.className = `relay-dot ${dotCls}`.trim();
-  txt.textContent = state.active ? '已收到新码' : state.conn === 'live' ? '实时等待中' : state.conn === 'error' ? '重连中' : '连接中';
-  return true;
+// ---------- 轮询状态机（防 Abort 风暴 + 指数退避 + 离线感知） ----------
+
+function abortActivePoll() {
+  if (state.pollAbort) {
+    state.pollAbort.abort();
+    state.pollAbort = null;
+  }
+  if (state.retryAbort) {
+    state.retryAbort.abort();
+    state.retryAbort = null;
+  }
 }
 
-function applyPayload(data) {
+function sleepAbortable(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(tid);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const tid = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function pollOnce(waitSec, room) {
+  if (state.pollAbort) state.pollAbort.abort();
+  const ac = new AbortController();
+  state.pollAbort = ac;
+  const url = `/api/v1/relay/${encodeURIComponent(room)}?since=${state.seq}&wait=${waitSec}`;
+  const resp = await fetch(url, { signal: ac.signal, cache: 'no-store' });
+  if (!resp.ok) {
+    const err = new Error(`HTTP ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return resp.json();
+}
+
+function applyPayload(data, expectedRoom) {
+  if (expectedRoom && expectedRoom !== state.room) return;
+  if (data && data.room && data.room !== state.room) return;
+
   const prevActive = state.active;
   const prevSeq = state.item ? state.item.seq : 0;
-  const prevConn = state.conn;
 
   state.conn = 'live';
   state.seq = typeof data.seq === 'number' ? data.seq : state.seq;
 
   if (!data.active || !data.url) {
+    clearPendingRedirect();
     state.active = false;
     state.item = null;
     state.redirectNotice = false;
-    if (prevActive) render();
-    else if (prevConn !== 'live' && !updateStatusChipInPlace()) render();
+    syncTtlTimer();
+    if (prevActive) {
+      syncMainSlot();
+    }
+    updateStatusChipInPlace();
     return;
   }
 
@@ -331,71 +605,129 @@ function applyPayload(data) {
     host: data.host || '',
     expiresAtLocal: (data.expiresAt || Date.now() + 90000) - drift,
   };
-  const isNewKey = !hasRedirected(item);
+  const key = redirectedKey(item);
+  const alreadyDone = hasRedirectedKey(key);
+
   state.active = true;
   state.item = item;
-  state.redirectNotice = !isNewKey;
-  ensureQR(item.url);
+  state.redirectNotice = alreadyDone;
 
-  if (!prevActive || prevSeq !== item.seq) {
-    render();
-  } else if (prevConn !== 'live' && !updateStatusChipInPlace()) {
-    render();
-  }
+  const itemChanged = !prevActive || prevSeq !== item.seq;
 
-  if (state.mode === 'recv' && state.autoRedirect && isNewKey && document.visibilityState === 'visible') {
-    markRedirected(item);
-    setTimeout(() => {
-      if (state.mode === 'recv' && state.active && state.item && state.item.seq === item.seq) {
-        window.location.href = item.url;
+  // 仅在 recv 模式且开启自动跳转且未跳转过时，先进入焦点门控跳转流程，绝不提前同步生成 QR。
+  let deferQr = false;
+  if (state.mode === 'recv') {
+    if (state.autoRedirect && !alreadyDone) {
+      const samePending = state.pendingRedirect && state.pendingRedirect.key === key;
+      if (!samePending) {
+        clearRedirectWatchdog();
+        state.pendingRedirect = {
+          key,
+          seq: item.seq,
+          url: item.url,
+          source: item.source,
+          host: item.host,
+          expiresAtLocal: item.expiresAtLocal,
+        };
+        state.redirectStatus = 'idle';
       }
-    }, 120);
+      deferQr = true;
+    } else {
+      if (state.pendingRedirect && state.pendingRedirect.key !== key) {
+        clearPendingRedirect();
+      }
+      state.redirectStatus = alreadyDone ? 'done' : 'idle';
+      ensureQR(item.url);
+    }
+  } else {
+    clearPendingRedirect();
+  }
+
+  syncTtlTimer();
+  if (itemChanged) {
+    syncMainSlot();
+  } else {
+    updateTtlInPlace();
+    updateRedirectPromptInPlace();
+  }
+  updateStatusChipInPlace();
+
+  if (deferQr) {
+    tryExecutePendingRedirect({ fromGesture: false });
   }
 }
 
-async function pollOnce(waitSec) {
-  if (state.pollAbort) state.pollAbort.abort();
-  const ac = new AbortController();
-  state.pollAbort = ac;
-  const url = `/api/v1/relay/${encodeURIComponent(state.room)}?since=${state.seq}&wait=${waitSec}`;
-  const resp = await fetch(url, { signal: ac.signal, cache: 'no-store' });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  return resp.json();
-}
-
-async function runPollLoop(immediateFirst) {
-  if (state.pollRunning) return;
-  state.pollRunning = true;
+async function runPollLoop(gen, immediateFirst) {
   let first = immediateFirst;
-  while (state.pollRunning) {
-    if (document.visibilityState === 'hidden') {
-      state.pollRunning = false;
+  let attempt = 0;
+
+  while (gen === state.pollGen) {
+    if (!state.visible || !state.online) {
+      if (!state.online) {
+        state.conn = 'offline';
+        updateStatusChipInPlace();
+      }
       return;
     }
+
+    const reqRoom = state.room;
     try {
       const waitSec = first ? 0 : 15;
       first = false;
-      const data = await pollOnce(waitSec);
-      applyPayload(data);
+      const data = await pollOnce(waitSec, reqRoom);
+      if (gen !== state.pollGen) return;
+      attempt = 0;
+      applyPayload(data, reqRoom);
     } catch (err) {
-      if (err && err.name === 'AbortError') {
-        if (!state.pollRunning) return;
-        first = true;
-        continue;
+      if (gen !== state.pollGen) return;
+      if (err && err.name === 'AbortError') return;
+
+      if (!state.online || (typeof navigator.onLine === 'boolean' && !navigator.onLine)) {
+        state.online = false;
+        state.conn = 'offline';
+        updateStatusChipInPlace();
+        return;
       }
+
       state.conn = 'error';
-      if (!updateStatusChipInPlace()) render();
-      await new Promise((r) => setTimeout(r, 1500));
+      updateStatusChipInPlace();
+
+      const base = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+      const floor = err && err.status === 429 ? Math.max(base, 3000) : base;
+      attempt += 1;
+      const delay = Math.round(floor * (0.8 + Math.random() * 0.4));
+
+      const sleepAc = new AbortController();
+      state.retryAbort = sleepAc;
+      try {
+        await sleepAbortable(delay, sleepAc.signal);
+      } catch {
+        return;
+      }
+      if (gen !== state.pollGen) return;
+      state.retryAbort = null;
+      first = true;
     }
   }
 }
 
+function stopPolling() {
+  state.pollGen += 1;
+  abortActivePoll();
+}
+
 function restartPolling() {
-  if (state.pollAbort) state.pollAbort.abort();
-  state.pollRunning = false;
+  const gen = ++state.pollGen;
+  abortActivePoll();
+  if (!state.online) {
+    state.conn = 'offline';
+    updateStatusChipInPlace();
+    return;
+  }
+  if (!state.visible) return;
   state.conn = 'connecting';
-  if (!updateStatusChipInPlace()) render();
-  runPollLoop(true);
+  updateStatusChipInPlace();
+  runPollLoop(gen, true);
 }
 
 // ---------- 发码端逻辑 ----------
@@ -404,7 +736,7 @@ async function pushUrl(rawUrl, sourceOverride) {
   const url = extractUrl(rawUrl);
   if (!url) {
     state.senderError = '未识别到合法的 http:// 或 https:// 链接';
-    render();
+    updateSenderInPlace();
     return false;
   }
   const source = sourceOverride || guessSource(url, state.senderSource);
@@ -413,18 +745,21 @@ async function pushUrl(rawUrl, sourceOverride) {
 
   state.senderBusy = true;
   state.senderError = '';
-  render();
+  updateSenderInPlace();
 
+  const targetRoom = state.room;
   try {
-    const resp = await fetch(`/api/v1/relay/${encodeURIComponent(state.room)}`, {
+    const resp = await fetch(`/api/v1/relay/${encodeURIComponent(targetRoom)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, source, ttlSec: state.senderTtl }),
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.message || data.error || `HTTP ${resp.status}`);
+    if (targetRoom !== state.room) return false;
     state.senderUrl = url;
     applyPayload({
+      room: targetRoom,
       active: true,
       seq: data.seq,
       url: data.url || url,
@@ -432,8 +767,8 @@ async function pushUrl(rawUrl, sourceOverride) {
       host: data.host || '',
       expiresAt: data.expiresAt,
       serverTime: data.serverTime,
-    });
-    toast(`已发送到房间 ${state.room}`);
+    }, targetRoom);
+    toast(`已发送到房间 ${targetRoom}`);
     return true;
   } catch (err) {
     state.senderError = (err && err.message) || '发送失败，请稍后重试';
@@ -441,7 +776,7 @@ async function pushUrl(rawUrl, sourceOverride) {
     return false;
   } finally {
     state.senderBusy = false;
-    render();
+    updateSenderInPlace();
   }
 }
 
@@ -451,22 +786,26 @@ async function handleScannedText(rawText) {
   if (!url) {
     state.senderUrl = text;
     state.senderError = '二维码内容不包含 http(s):// 链接，已填入下方文本框供核对';
-    render();
+    updateSenderInPlace(true);
     toast('未识别到网址，请检查二维码内容');
     return;
   }
   state.senderUrl = url;
+  updateSenderInPlace(true);
   await pushUrl(url, guessSource(url, state.senderSource));
 }
 
-function getScanCapability() {
-  const hasCamera = Boolean(
-    navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function',
-  );
-  if (hasCamera) {
+function getScanBadgeInfo() {
+  let support = { camera: false, barcodeDetector: false, wasmWorker: false };
+  try {
+    support = getScannerSupport() || support;
+  } catch { /* ignore */ }
+  if (support.camera) {
     return {
       ready: true,
-      label: '高清远距扫码就绪（支持变焦与拍照识码）',
+      label: support.barcodeDetector
+        ? '高清远距扫码就绪（原生加速 + 变焦）'
+        : '高清远距扫码就绪（支持变焦与拍照识码）',
     };
   }
   return {
@@ -481,33 +820,60 @@ function handlePrimaryScan() {
 }
 
 function openWebScanner() {
-  openCameraScanner({
+  if (state.cameraHandle) {
+    try { state.cameraHandle.close(); } catch { /* ignore */ }
+    state.cameraHandle = null;
+  }
+  state.cameraHandle = openCameraScanner({
     onResult: (text) => { handleScannedText(text); },
     onPickFile: () => { fileInput.click(); },
+    onClose: () => { state.cameraHandle = null; },
   });
 }
 
 async function handleImageFile(file) {
+  if (state.decodeAbort) {
+    state.decodeAbort.abort();
+  }
+  const ac = new AbortController();
+  state.decodeAbort = ac;
+
   state.senderBusy = true;
   state.senderProgress = '正在读取原图…';
   state.senderError = '';
-  render();
+  updateSenderInPlace();
+
   try {
     const text = await decodeImageFile(file, {
-      onProgress: (label) => {
-        state.senderProgress = label;
-        render();
+      signal: ac.signal,
+      onProgress: (info) => {
+        if (ac.signal.aborted) return;
+        const label = typeof info === 'string'
+          ? info
+          : (info && typeof info.label === 'string' ? info.label : '');
+        if (label) {
+          state.senderProgress = label;
+          updateSenderInPlace();
+        }
       },
     });
+    if (ac.signal.aborted) return;
+    state.decodeAbort = null;
     state.senderBusy = false;
     state.senderProgress = '';
+    updateSenderInPlace();
     await handleScannedText(text);
   } catch (err) {
+    if (state.decodeAbort === ac) state.decodeAbort = null;
     state.senderBusy = false;
     state.senderProgress = '';
+    if (err && err.name === 'AbortError') {
+      updateSenderInPlace();
+      return;
+    }
     state.senderError = (err && err.message) || '图片识码失败';
     toast(state.senderError);
-    render();
+    updateSenderInPlace();
   }
 }
 
@@ -516,7 +882,7 @@ async function handlePasteOrExtract() {
   if (existing && existing !== state.senderUrl.trim()) {
     state.senderUrl = existing;
     state.senderError = '';
-    render();
+    updateSenderInPlace(true);
     toast('已从文本中提取链接');
     return;
   }
@@ -527,7 +893,7 @@ async function handlePasteOrExtract() {
         const extracted = extractUrl(clip);
         state.senderUrl = extracted || clip;
         state.senderError = extracted ? '' : '剪贴板内容未检测到 http(s):// 链接';
-        render();
+        updateSenderInPlace(true);
         toast(extracted ? '已粘贴并提取链接' : '已粘贴剪贴板内容');
         return;
       }
@@ -539,10 +905,13 @@ async function handlePasteOrExtract() {
 async function clearActiveItem() {
   try {
     await fetch(`/api/v1/relay/${encodeURIComponent(state.room)}`, { method: 'DELETE' });
+    clearPendingRedirect();
     state.active = false;
     state.item = null;
     state.redirectNotice = false;
-    render();
+    syncTtlTimer();
+    syncMainSlot();
+    updateStatusChipInPlace();
     toast('已清除当前签到码');
   } catch {
     toast('清除失败，请稍后重试');
@@ -558,7 +927,7 @@ function openPresetEditDialog(preset, onSaved) {
     value: preset.url,
     placeholder: 'https://...',
   });
-  const errEl = h('p', { class: 'form-error', hidden: true });
+  const errEl = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const form = h('form', {
     class: 'form',
     onsubmit: (e) => {
@@ -572,7 +941,7 @@ function openPresetEditDialog(preset, onSaved) {
       preset.url = val;
       savePresets(state.presets);
       dlg.close();
-      render();
+      updatePrewarmInPlace();
       if (onSaved && val) onSaved(preset);
     },
   },
@@ -598,276 +967,239 @@ function startPrewarm(preset) {
     return;
   }
   recordWarmed(preset);
-  state.warmed = loadWarmed();
-  window.location.href = preset.url;
+  updatePrewarmInPlace();
+  window.location.assign(preset.url);
 }
 
-// ---------- 视图渲染 ----------
+// ---------- 局部原地更新函数 ----------
 
-function renderStatusChip() {
-  const dotCls = state.active ? 'active' : state.conn === 'live' ? 'live' : state.conn === 'error' ? 'err' : '';
-  const text = state.active ? '已收到新码' : state.conn === 'live' ? '实时等待中' : state.conn === 'error' ? '重连中' : '连接中';
-  return h('div', { class: 'sync-chip', id: 'relay-status-chip', 'aria-live': 'polite' },
-    h('span', { class: `relay-dot ${dotCls}`.trim() }),
-    h('span', { class: 'relay-status-text' }, text));
-}
+function updateStatusChipInPlace() {
+  if (!ui.statusChip) return;
 
-function renderRoleSwitcher() {
-  return h('div', { class: 'seg mode-switch', role: 'tablist', 'aria-label': '角色模式' },
-    h('button', {
-      type: 'button',
-      class: 'seg-btn',
-      role: 'tab',
-      'aria-pressed': String(state.mode === 'send'),
-      'aria-selected': String(state.mode === 'send'),
-      onclick: () => setMode('send'),
-    }, '扫码发码'),
-    h('button', {
-      type: 'button',
-      class: 'seg-btn',
-      role: 'tab',
-      'aria-pressed': String(state.mode === 'recv'),
-      'aria-selected': String(state.mode === 'recv'),
-      onclick: () => setMode('recv'),
-    }, '收码等待'));
-}
+  let dotCls = '';
+  let text = '连接中';
+  let interactive = false;
+  let extraChipCls = '';
+  let ariaLabel = '';
 
-function renderRoomBar() {
-  const roomInput = h('input', {
-    class: 'input room-input',
-    value: state.roomDraft,
-    maxlength: 32,
-    placeholder: '3–32 位字母/数字/_/-',
-    'aria-label': '房间口令',
-    oninput: (e) => { state.roomDraft = e.target.value; },
-  });
-
-  const form = h('form', {
-    class: 'room-form',
-    onsubmit: (e) => {
-      e.preventDefault();
-      setRoom(roomInput.value);
-    },
-  },
-    h('span', { class: 'room-label' }, '房间'),
-    roomInput,
-    h('button', {
-      type: 'button',
-      class: 'icon-btn',
-      title: '随机房间号',
-      'aria-label': '生成随机房间号',
-      onclick: () => setRoom(randomRoomId()),
-    }, icon('shuffle', 18)),
-    h('button', { type: 'submit', class: 'btn small tonal' }, '切换'));
-
-  return h('section', { class: 'card room-bar', 'aria-label': '房间设置与分享' },
-    form,
-    h('div', { class: 'room-links' },
-      h('button', {
-        type: 'button',
-        class: 'btn small',
-        onclick: async () => {
-          const ok = await copyText(buildShareUrl(state.room, 'recv'));
-          toast(ok ? '已复制室友收码链接' : '复制失败，请手动复制地址栏');
-        },
-      }, icon('copy', 16), '复制收码链接'),
-      h('button', {
-        type: 'button',
-        class: 'btn small',
-        onclick: async () => {
-          const ok = await copyText(buildShareUrl(state.room, 'send'));
-          toast(ok ? '已复制教室发码链接' : '复制失败，请手动复制地址栏');
-        },
-      }, icon('link', 16), '复制发码链接')));
-}
-
-function renderActivePreview() {
-  if (!state.active || !state.item) return null;
-  const { item } = state;
-  const remain = Math.max(0, Math.ceil((item.expiresAtLocal - Date.now()) / 1000));
-  return h('div', { class: 'sender-preview' },
-    h('div', { class: 'relay-active-head' },
-      h('div', { class: 'relay-badges' },
-        h('span', { class: 'relay-pill' }, item.source),
-        h('span', { class: 'relay-pill ttl', id: 'relay-ttl' }, `${remain}s 后过期`)),
-      h('button', { type: 'button', class: 'btn small danger-ghost', onclick: clearActiveItem }, '清除')),
-    h('div', { class: 'stack-sm' },
-      h('b', {}, item.host || '当前房间有效链接'),
-      h('p', { class: 'relay-url' }, item.url)));
-}
-
-function renderSenderCard() {
-  const scanCap = getScanCapability();
-  const badgeCls = scanCap.ready ? 'ready' : 'warn';
-  const urlInput = h('textarea', {
-    class: 'input relay-tonal-input',
-    value: state.senderUrl,
-    placeholder: '粘贴包含 http(s):// 的签到链接或文本',
-    oninput: (e) => {
-      state.senderUrl = e.target.value;
-      state.senderError = '';
-    },
-  });
-
-  const sourceGroup = h('div', { class: 'seg', role: 'group', 'aria-label': '来源平台' },
-    ...SOURCES.map((s) => h('button', {
-      type: 'button',
-      class: 'seg-btn',
-      'aria-pressed': String(s === state.senderSource),
-      onclick: () => {
-        state.senderSource = s;
-        try { localStorage.setItem(STORAGE_SOURCE, s); } catch { /* ignore */ }
-        render();
-      },
-    }, s)));
-
-  const ttlGroup = h('div', { class: 'seg', role: 'group', 'aria-label': '有效时长' },
-    ...TTLS.map((t) => h('button', {
-      type: 'button',
-      class: 'seg-btn',
-      'aria-pressed': String(t === state.senderTtl),
-      onclick: () => {
-        state.senderTtl = t;
-        try { localStorage.setItem(STORAGE_TTL, String(t)); } catch { /* ignore */ }
-        render();
-      },
-    }, `${t} 秒`)));
-
-  const pasteForm = h('form', {
-    class: 'sender-form',
-    onsubmit: async (e) => {
-      e.preventDefault();
-      await pushUrl(state.senderUrl, state.senderSource);
-    },
-  },
-    h('div', { class: 'field' },
-      h('div', { class: 'field-head' },
-        h('span', { class: 'field-label' }, '粘贴链接发送'),
-        h('button', {
-          type: 'button',
-          class: 'btn small ghost',
-          onclick: handlePasteOrExtract,
-        }, '粘贴 / 提取')),
-      urlInput),
-    h('div', { class: 'field' },
-      h('span', { class: 'field-label' }, '签到平台'),
-      sourceGroup),
-    h('div', { class: 'field' },
-      h('span', { class: 'field-label' }, '有效时长'),
-      ttlGroup),
-    state.senderError ? h('p', { class: 'form-error' }, state.senderError) : null,
-    h('div', { class: 'sender-form-actions' },
-      h('button', {
-        type: 'submit',
-        class: 'btn primary',
-        disabled: state.senderBusy,
-      }, icon('send', 18), state.senderBusy ? '发送中…' : '推送到房间'),
-      h('button', {
-        type: 'button',
-        class: 'btn danger-ghost',
-        disabled: !state.active,
-        onclick: clearActiveItem,
-      }, icon('trash', 18), '清除')));
-
-  return h('section', { class: 'card relay-card' },
-    h('div', { class: `scan-badge ${badgeCls}` },
-      h('span', { class: `relay-dot ${scanCap.ready ? 'live' : ''}`.trim() }),
-      h('span', {}, scanCap.label)),
-    h('div', { class: 'sender-scan-actions' },
-      h('button', {
-        type: 'button',
-        class: 'btn primary hero',
-        disabled: state.senderBusy,
-        onclick: handlePrimaryScan,
-      }, icon('scan', 22), '扫一扫并发送'),
-      h('button', {
-        type: 'button',
-        class: 'btn tonal wide-btn',
-        disabled: state.senderBusy,
-        onclick: () => fileInput.click(),
-      }, icon('image', 18), state.senderProgress || '拍照 / 相册识码')),
-    renderActivePreview(),
-    h('div', { class: 'sender-divider' }, '或手动粘贴链接'),
-    pasteForm);
-}
-
-function renderReceiverCard() {
-  const switchRow = h('div', { class: 'relay-switch-row' },
-    h('div', { class: 'relay-switch-text' },
-      h('b', {}, '收到新码自动跳转'),
-      h('span', {}, '使用 location.href，保留微信左上角返回键')),
-    h('button', {
-      type: 'button',
-      class: 'relay-switch',
-      role: 'switch',
-      'aria-checked': String(state.autoRedirect),
-      'aria-label': '收到新码自动跳转',
-      onclick: () => {
-        state.autoRedirect = !state.autoRedirect;
-        saveAutoRedirect(state.autoRedirect);
-        render();
-      },
-    }));
-
-  if (!state.active || !state.item) {
-    return h('section', { class: 'card relay-card' },
-      h('div', { class: 'relay-wait' },
-        h('div', { class: 'relay-emblem' }, icon('sparkle', 28)),
-        h('h2', {}, '等待教室端传码'),
-        h('p', {}, '建议将本页设为微信「浮窗」，收到通知点回即可接力签到')),
-      switchRow);
+  if (!state.online || state.conn === 'offline') {
+    dotCls = 'err';
+    text = '网络已断开';
+    interactive = true;
+    extraChipCls = 'err-chip';
+    ariaLabel = '网络已断开，点击尝试重新连接';
+  } else if (state.mode === 'recv' && state.pendingRedirect && state.redirectStatus === 'awaiting-focus') {
+    dotCls = 'warn';
+    text = '待轻触跳转';
+    interactive = true;
+    extraChipCls = 'warn-chip';
+    ariaLabel = '待轻触跳转，点击立即前往签到';
+  } else if (state.mode === 'recv' && state.pendingRedirect && state.redirectStatus === 'blocked') {
+    dotCls = 'err';
+    text = '跳转被拦截';
+    interactive = true;
+    extraChipCls = 'err-chip';
+    ariaLabel = '自动跳转被拦截，点击立即前往签到';
+  } else if (state.conn === 'error') {
+    dotCls = 'err';
+    text = '连接中断 · 重试';
+    interactive = true;
+    extraChipCls = 'err-chip';
+    ariaLabel = '连接中断，点击立即重连';
+  } else if (state.active) {
+    dotCls = 'active';
+    text = '已收到新码';
+  } else if (state.conn === 'live') {
+    dotCls = 'live';
+    text = '实时等待中';
   }
 
-  const { item } = state;
-  const remain = Math.max(0, Math.ceil((item.expiresAtLocal - Date.now()) / 1000));
-  const qrImg = state.qrDataUrl
-    ? h('div', { class: 'relay-qr-wrap' },
-        h('img', { class: 'relay-qr-img', src: state.qrDataUrl, alt: '兜底签到二维码' }),
-        h('p', { class: 'hint center' }, '若自动跳转被拦截，可长按二维码识别'))
-    : null;
-
-  return h('section', { class: 'card relay-card' },
-    h('div', { class: 'relay-active-head' },
-      h('div', { class: 'relay-badges' },
-        h('span', { class: 'relay-pill' }, item.source),
-        h('span', { class: 'relay-pill ttl', id: 'relay-ttl' }, `${remain}s 后过期`)),
-      h('button', { type: 'button', class: 'btn small ghost', onclick: clearActiveItem }, '清除')),
-    h('div', { class: 'stack-sm' },
-      h('h2', { class: 'relay-host' }, item.host || '签到链接已就绪'),
-      h('p', { class: 'relay-url' }, item.url)),
-    state.redirectNotice
-      ? h('p', { class: 'relay-notice' }, '本条链接已自动跳转过；如需再次打开，请点击下方按钮或长按二维码。')
-      : null,
-    h('div', { class: 'relay-cta-col' },
-      h('a', {
-        class: 'btn primary wide-btn',
-        href: item.url,
-        onclick: () => markRedirected(item),
-      }, icon('external', 18), '立即前往签到'),
-      h('div', { class: 'relay-cta-sub' },
-        h('button', {
-          type: 'button',
-          class: 'btn tonal',
-          onclick: async () => {
-            const ok = await copyText(item.url);
-            toast(ok ? '已复制签到链接' : '复制失败，请手动长按链接');
-          },
-        }, icon('copy', 16), '复制链接'),
-        h('button', {
-          type: 'button',
-          class: 'btn',
-          onclick: () => {
-            state.senderUrl = item.url;
-            if (SOURCES.includes(item.source)) state.senderSource = item.source;
-            setMode('send');
-          },
-        }, '切换到发码'))),
-    qrImg,
-    switchRow);
+  ui.statusDot.className = `relay-dot ${dotCls}`.trim();
+  ui.statusText.textContent = text;
+  ui.statusChip.disabled = !interactive;
+  ui.statusChip.className = `sync-chip${interactive ? ' interactive' : ''}${extraChipCls ? ` ${extraChipCls}` : ''}`;
+  if (ariaLabel) {
+    ui.statusChip.setAttribute('aria-label', ariaLabel);
+    ui.statusChip.title = ariaLabel;
+  } else {
+    ui.statusChip.removeAttribute('aria-label');
+    ui.statusChip.removeAttribute('title');
+  }
 }
 
-function renderPrewarmSection() {
-  state.warmed = loadWarmed();
+function updateRoleSwitcherInPlace() {
+  if (!ui.roleSendBtn || !ui.roleRecvBtn) return;
+  ui.roleSendBtn.setAttribute('aria-pressed', String(state.mode === 'send'));
+  ui.roleRecvBtn.setAttribute('aria-pressed', String(state.mode === 'recv'));
+}
+
+function updateRoomBarInPlace() {
+  if (!ui.roomBar) return;
+  ui.roomCodeText.textContent = state.room;
+  ui.roomBar.classList.toggle('expanded', state.roomBarExpanded);
+  ui.roomDrawer.hidden = !state.roomBarExpanded;
+  ui.roomToggleBtn.setAttribute('aria-expanded', String(state.roomBarExpanded));
+  if (document.activeElement !== ui.roomInput && ui.roomInput.value !== state.roomDraft) {
+    ui.roomInput.value = state.roomDraft;
+  }
+}
+
+function updateTtlInPlace() {
+  if (!state.active || !state.item) return;
+  const remain = remainSeconds(state.item.expiresAtLocal);
+  const el = document.getElementById('relay-ttl');
+  if (el) {
+    el.textContent = `${remain}s 后过期`;
+    el.classList.toggle('urgent', remain <= 15);
+  }
+  if (ui.recv && ui.recv.promptSub && state.pendingRedirect && state.redirectStatus === 'awaiting-focus') {
+    ui.recv.promptSub.textContent = `已收到 ${state.pendingRedirect.source} 签到码（剩余 ${remain}s）`;
+  }
+}
+
+function updateRedirectPromptInPlace() {
+  if (!ui.recv || !ui.recv.promptSlot) return;
+  const slot = ui.recv.promptSlot;
+  clear(slot);
+  ui.recv.promptSub = null;
+
+  const pending = state.pendingRedirect;
+  const showAwaiting = state.mode === 'recv' && pending && state.redirectStatus === 'awaiting-focus';
+  const showBlocked = state.mode === 'recv' && pending && state.redirectStatus === 'blocked';
+
+  if (ui.recv.noticeEl) {
+    ui.recv.noticeEl.hidden = !state.redirectNotice || showAwaiting || showBlocked;
+  }
+
+  if (!showAwaiting && !showBlocked) {
+    slot.hidden = true;
+    return;
+  }
+
+  slot.hidden = false;
+  const remain = remainSeconds(pending.expiresAtLocal);
+
+  if (showAwaiting) {
+    const sub = h('p', { class: 'redirect-prompt-sub' }, `已收到 ${pending.source} 签到码（剩余 ${remain}s）`);
+    ui.recv.promptSub = sub;
+    slot.append(
+      h('div', { class: 'redirect-prompt', role: 'alert', 'aria-live': 'assertive' },
+        h('div', { class: 'redirect-prompt-text' },
+          h('strong', { class: 'redirect-prompt-title' }, '未获取焦点，轻触屏幕即可自动跳转'),
+          sub),
+        h('button', {
+          type: 'button',
+          class: 'btn primary hero',
+          onclick: () => tryExecutePendingRedirect({ fromGesture: true }),
+        }, icon('external', 18), '立即跳转')),
+    );
+    return;
+  }
+
+  // blocked 状态：提供零 JS 兜底原生 <a href> 按钮
+  slot.append(
+    h('div', { class: 'redirect-prompt blocked', role: 'alert', 'aria-live': 'assertive' },
+      h('div', { class: 'redirect-prompt-text' },
+        h('strong', { class: 'redirect-prompt-title' }, '微信拦截了自动跳转，轻触立即前往'),
+        h('p', { class: 'redirect-prompt-sub' }, '点击任意提示区或下方按钮直接打开')),
+      h('a', {
+        class: 'btn primary hero',
+        href: pending.url,
+        onclick: () => {
+          markRedirectedKey(pending.key);
+          clearPendingRedirect();
+          state.redirectStatus = 'done';
+          state.redirectNotice = true;
+        },
+      }, icon('external', 18), '立即前往签到')),
+  );
+}
+
+function updateRecvQrInPlace() {
+  if (!ui.recv || !ui.recv.qrSlot || !state.active || !state.item) return;
+  const slot = ui.recv.qrSlot;
+  if (!state.qrDataUrl || state.qrForUrl !== state.item.url) {
+    slot.hidden = true;
+    return;
+  }
+  const existingImg = slot.querySelector('.relay-qr-img');
+  if (existingImg && existingImg.getAttribute('src') === state.qrDataUrl) {
+    slot.hidden = false;
+    return;
+  }
+  clear(slot);
+  slot.hidden = false;
+  slot.append(
+    h('div', { class: 'relay-qr-wrap' },
+      h('img', { class: 'relay-qr-img', src: state.qrDataUrl, alt: '兜底签到二维码' }),
+      h('p', { class: 'hint center' }, '若自动跳转被拦截，可长按二维码识别')),
+  );
+}
+
+function updateSenderPreviewInPlace() {
+  if (!ui.sender || !ui.sender.previewSlot) return;
+  const slot = ui.sender.previewSlot;
+  clear(slot);
+  if (!state.active || !state.item) {
+    slot.hidden = true;
+    return;
+  }
+  const { item } = state;
+  const remain = remainSeconds(item.expiresAtLocal);
+  slot.hidden = false;
+  slot.append(
+    h('div', { class: 'sender-preview' },
+      h('div', { class: 'relay-active-head' },
+        h('div', { class: 'relay-badges' },
+          h('span', { class: 'relay-pill' }, item.source),
+          h('span', { class: `relay-pill ttl${remain <= 15 ? ' urgent' : ''}`, id: 'relay-ttl' }, `${remain}s 后过期`)),
+        h('button', { type: 'button', class: 'btn small danger-ghost', onclick: clearActiveItem }, '清除')),
+      h('div', { class: 'stack-sm' },
+        h('b', {}, item.host || '当前房间有效链接'),
+        h('p', { class: 'relay-url' }, item.url))),
+  );
+}
+
+function updateSenderInPlace(syncInputValue = false) {
+  if (!ui.sender) return;
+  const s = ui.sender;
+  if (syncInputValue && s.urlInput.value !== state.senderUrl) {
+    s.urlInput.value = state.senderUrl;
+  }
+  s.scanBtn.disabled = state.senderBusy;
+  s.fileBtn.disabled = state.senderBusy;
+  s.fileBtnText.textContent = state.senderProgress || '拍照 / 相册识码';
+  s.submitBtn.disabled = state.senderBusy;
+  s.submitBtnText.textContent = state.senderBusy ? '发送中…' : '推送到房间';
+  s.clearBtn.disabled = !state.active;
+
+  for (const [val, btn] of s.sourceBtns) {
+    btn.setAttribute('aria-pressed', String(val === state.senderSource));
+  }
+  for (const [val, btn] of s.ttlBtns) {
+    btn.setAttribute('aria-pressed', String(val === state.senderTtl));
+  }
+
+  if (state.senderError) {
+    s.errorEl.textContent = state.senderError;
+    s.errorEl.hidden = false;
+    s.urlInput.setAttribute('aria-describedby', 'sender-url-error');
+  } else {
+    s.errorEl.textContent = '';
+    s.errorEl.hidden = true;
+    s.urlInput.removeAttribute('aria-describedby');
+  }
+}
+
+function updatePrewarmInPlace() {
+  if (!ui.prewarmSlot) return;
+  if (state.mode !== 'recv') {
+    ui.prewarmSlot.hidden = true;
+    return;
+  }
+  ui.prewarmSlot.hidden = false;
+  clear(ui.prewarmSlot);
+
   const rows = state.presets.map((p) => {
     const w = state.warmed[p.id];
     const sub = p.url ? p.url : p.note;
@@ -891,17 +1223,313 @@ function renderPrewarmSection() {
         }, p.url ? '去预热' : '配置')));
   });
 
-  return h('section', { class: 'relay-section' },
-    h('div', { class: 'relay-section-head' },
-      h('span', { class: 'relay-section-title' }, '课前预热'),
-      h('span', { class: 'relay-section-status' }, latestWarmedSummary(state.warmed))),
-    h('div', { class: 'relay-prewarm-list' }, ...rows));
+  ui.prewarmSlot.append(
+    h('section', { class: 'relay-section' },
+      h('div', { class: 'relay-section-head' },
+        h('span', { class: 'relay-section-title' }, '课前预热'),
+        h('span', { class: 'relay-section-status' }, latestWarmedSummary(state.warmed))),
+      h('div', { class: 'relay-prewarm-list' }, ...rows)),
+  );
 }
 
-function render() {
+// ---------- 卡片构建（按结构键重建，避免无谓销毁） ----------
+
+function buildSenderCard() {
+  const scanCap = getScanBadgeInfo();
+  const badgeCls = scanCap.ready ? 'ready' : 'warn';
+
+  const urlInput = h('textarea', {
+    id: 'sender-url-input',
+    class: 'input relay-tonal-input',
+    value: state.senderUrl,
+    placeholder: '粘贴包含 http(s):// 的签到链接或文本',
+    oninput: (e) => {
+      state.senderUrl = e.target.value;
+      if (state.senderError) {
+        state.senderError = '';
+        updateSenderInPlace();
+      }
+    },
+  });
+
+  const sourceBtns = new Map();
+  const sourceGroup = h('div', { class: 'seg', role: 'group', 'aria-label': '来源平台' },
+    ...SOURCES.map((s) => {
+      const btn = h('button', {
+        type: 'button',
+        class: 'seg-btn',
+        'aria-pressed': String(s === state.senderSource),
+        onclick: () => {
+          state.senderSource = s;
+          try { localStorage.setItem(STORAGE_SOURCE, s); } catch { /* ignore */ }
+          updateSenderInPlace();
+        },
+      }, s);
+      sourceBtns.set(s, btn);
+      return btn;
+    }));
+
+  const ttlBtns = new Map();
+  const ttlGroup = h('div', { class: 'seg', role: 'group', 'aria-label': '有效时长' },
+    ...TTLS.map((t) => {
+      const btn = h('button', {
+        type: 'button',
+        class: 'seg-btn',
+        'aria-pressed': String(t === state.senderTtl),
+        onclick: () => {
+          state.senderTtl = t;
+          try { localStorage.setItem(STORAGE_TTL, String(t)); } catch { /* ignore */ }
+          updateSenderInPlace();
+        },
+      }, `${t} 秒`);
+      ttlBtns.set(t, btn);
+      return btn;
+    }));
+
+  const errorEl = h('p', { id: 'sender-url-error', class: 'form-error', role: 'alert', hidden: true });
+  const submitBtnText = h('span', {}, '推送到房间');
+  const submitBtn = h('button', { type: 'submit', class: 'btn primary' }, icon('send', 18), submitBtnText);
+  const clearBtn = h('button', {
+    type: 'button',
+    class: 'btn danger-ghost',
+    onclick: clearActiveItem,
+  }, icon('trash', 18), '清除');
+
+  const scanBtn = h('button', {
+    type: 'button',
+    class: 'btn primary hero',
+    onclick: handlePrimaryScan,
+  }, icon('scan', 22), '扫一扫并发送');
+
+  const fileBtnText = h('span', {}, '拍照 / 相册识码');
+  const fileBtn = h('button', {
+    type: 'button',
+    class: 'btn tonal wide-btn',
+    onclick: () => fileInput.click(),
+  }, icon('image', 18), fileBtnText);
+
+  const previewSlot = h('div', { hidden: true });
+
+  const pasteForm = h('form', {
+    class: 'sender-form',
+    onsubmit: async (e) => {
+      e.preventDefault();
+      await pushUrl(state.senderUrl, state.senderSource);
+    },
+  },
+    h('div', { class: 'field' },
+      h('div', { class: 'field-head' },
+        h('label', { class: 'field-label', for: 'sender-url-input' }, '粘贴链接发送'),
+        h('button', {
+          type: 'button',
+          class: 'btn small ghost',
+          onclick: handlePasteOrExtract,
+        }, '粘贴 / 提取')),
+      urlInput),
+    h('div', { class: 'field' },
+      h('span', { class: 'field-label' }, '签到平台'),
+      sourceGroup),
+    h('div', { class: 'field' },
+      h('span', { class: 'field-label' }, '有效时长'),
+      ttlGroup),
+    errorEl,
+    h('div', { class: 'sender-form-actions' }, submitBtn, clearBtn));
+
+  ui.sender = {
+    urlInput,
+    sourceBtns,
+    ttlBtns,
+    errorEl,
+    submitBtn,
+    submitBtnText,
+    clearBtn,
+    scanBtn,
+    fileBtn,
+    fileBtnText,
+    previewSlot,
+  };
+
+  const card = h('section', { class: 'card relay-card' },
+    h('div', { class: `scan-badge ${badgeCls}` },
+      h('span', { class: `relay-dot ${scanCap.ready ? 'live' : ''}`.trim() }),
+      h('span', {}, scanCap.label)),
+    h('div', { class: 'sender-scan-actions' }, scanBtn, fileBtn),
+    previewSlot,
+    h('div', { class: 'sender-divider' }, '或手动粘贴链接'),
+    pasteForm);
+
+  updateSenderInPlace(true);
+  updateSenderPreviewInPlace();
+  return card;
+}
+
+function buildSwitchRow() {
+  const switchBtn = h('button', {
+    type: 'button',
+    class: 'relay-switch',
+    role: 'switch',
+    'aria-checked': String(state.autoRedirect),
+    'aria-label': '收到新码自动跳转',
+    onclick: () => {
+      state.autoRedirect = !state.autoRedirect;
+      saveAutoRedirect(state.autoRedirect);
+      switchBtn.setAttribute('aria-checked', String(state.autoRedirect));
+      if (!state.autoRedirect) {
+        clearPendingRedirect();
+        updateRedirectPromptInPlace();
+        updateStatusChipInPlace();
+      }
+    },
+  });
+  return {
+    switchBtn,
+    row: h('div', { class: 'relay-switch-row' },
+      h('div', { class: 'relay-switch-text' },
+        h('b', {}, '收到新码自动跳转'),
+        h('span', {}, '使用 location.assign，保留微信左上角返回键')),
+      switchBtn),
+  };
+}
+
+function buildReceiverWaitCard() {
+  const { switchBtn, row } = buildSwitchRow();
+  ui.recv = { promptSlot: null, promptSub: null, noticeEl: null, qrSlot: null, switchBtn };
+  return h('section', { class: 'card relay-card' },
+    h('div', { class: 'relay-wait' },
+      h('div', { class: 'relay-emblem' }, icon('sparkle', 28)),
+      h('h2', {}, '等待教室端传码'),
+      h('p', {}, '建议将本页设为微信「浮窗」，收到通知点回即可接力签到')),
+    row);
+}
+
+function buildReceiverActiveCard() {
+  const { item } = state;
+  const remain = remainSeconds(item.expiresAtLocal);
+  const { switchBtn, row } = buildSwitchRow();
+
+  const promptSlot = h('div', { hidden: true });
+  const noticeEl = h('p', { class: 'relay-notice', hidden: !state.redirectNotice },
+    '本条链接已自动跳转过；如需再次打开，请点击下方按钮或长按二维码。');
+  const qrSlot = h('div', { hidden: true });
+
+  ui.recv = { promptSlot, promptSub: null, noticeEl, qrSlot, switchBtn };
+
+  const card = h('section', { class: 'card relay-card' },
+    promptSlot,
+    h('div', { class: 'relay-active-head' },
+      h('div', { class: 'relay-badges' },
+        h('span', { class: 'relay-pill' }, item.source),
+        h('span', { class: `relay-pill ttl${remain <= 15 ? ' urgent' : ''}`, id: 'relay-ttl' }, `${remain}s 后过期`)),
+      h('button', { type: 'button', class: 'btn small ghost', onclick: clearActiveItem }, '清除')),
+    h('div', { class: 'stack-sm' },
+      h('h2', { class: 'relay-host' }, item.host || '签到链接已就绪'),
+      h('p', { class: 'relay-url' }, item.url)),
+    noticeEl,
+    h('div', { class: 'relay-cta-col' },
+      h('a', {
+        class: 'btn primary hero',
+        href: item.url,
+        onclick: () => {
+          markRedirectedKey(redirectedKey(item));
+          clearPendingRedirect();
+          state.redirectStatus = 'done';
+          state.redirectNotice = true;
+        },
+      }, icon('external', 18), '立即前往签到'),
+      h('div', { class: 'relay-cta-sub' },
+        h('button', {
+          type: 'button',
+          class: 'btn tonal',
+          onclick: async () => {
+            const ok = await copyText(item.url);
+            toast(ok ? '已复制签到链接' : '复制失败，请手动长按链接');
+          },
+        }, icon('copy', 16), '复制链接'),
+        h('button', {
+          type: 'button',
+          class: 'btn',
+          onclick: () => {
+            state.senderUrl = item.url;
+            if (SOURCES.includes(item.source)) state.senderSource = item.source;
+            setMode('send');
+          },
+        }, '切换到发码'))),
+    qrSlot,
+    row);
+
+  updateRedirectPromptInPlace();
+  updateRecvQrInPlace();
+  return card;
+}
+
+function syncMainSlot() {
+  if (!ui.mainSlot) return;
+
+  if (state.mode === 'send') {
+    if (ui.mainKey !== 'send') {
+      ui.recv = null;
+      clear(ui.mainSlot);
+      ui.mainSlot.append(buildSenderCard());
+      ui.mainKey = 'send';
+    } else {
+      updateSenderInPlace();
+      updateSenderPreviewInPlace();
+    }
+    return;
+  }
+
+  // recv 模式
+  const nextKey = state.active && state.item ? `recv:${state.room}:${state.item.seq}` : 'recv:wait';
+  if (ui.mainKey !== nextKey) {
+    ui.sender = null;
+    clear(ui.mainSlot);
+    ui.mainSlot.append(state.active && state.item ? buildReceiverActiveCard() : buildReceiverWaitCard());
+    ui.mainKey = nextKey;
+  } else {
+    updateTtlInPlace();
+    updateRedirectPromptInPlace();
+    updateRecvQrInPlace();
+  }
+}
+
+function syncShell() {
+  if (!ui.mounted) {
+    mountShell();
+    return;
+  }
+  updateStatusChipInPlace();
+  updateRoleSwitcherInPlace();
+  updateRoomBarInPlace();
+  updateTapJumpClass();
+  syncMainSlot();
+  updatePrewarmInPlace();
+}
+
+// ---------- 持久化外壳挂载（仅执行一次） ----------
+
+function mountShell() {
   const root = document.getElementById('root');
   if (!root) return;
   clear(root);
+
+  ui.statusDot = h('span', { class: 'relay-dot' });
+  ui.statusText = h('span', { class: 'relay-status-text' }, '连接中');
+  ui.statusChip = h('button', {
+    type: 'button',
+    class: 'sync-chip',
+    id: 'relay-status-chip',
+    'aria-live': 'polite',
+    onclick: () => {
+      if (isTapJumpArmed()) {
+        tryExecutePendingRedirect({ fromGesture: true });
+        return;
+      }
+      if (!state.online || state.conn === 'offline' || state.conn === 'error') {
+        state.online = typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+        restartPolling();
+      }
+    },
+  }, ui.statusDot, ui.statusText);
 
   const topbar = h('header', { class: 'relay-topbar' },
     h('div', { class: 'relay-brand' },
@@ -909,62 +1537,271 @@ function render() {
       h('div', { class: 'relay-title-col' },
         h('h1', {}, '课堂接力'),
         h('span', { class: 'relay-subtitle' }, 'Class Relay · 微信纯网页版'))),
-    renderStatusChip());
+    ui.statusChip);
 
-  const mainChildren = [
-    topbar,
-    renderRoleSwitcher(),
-    renderRoomBar(),
-    state.mode === 'send' ? renderSenderCard() : renderReceiverCard(),
-  ];
+  ui.roleSendBtn = h('button', {
+    type: 'button',
+    class: 'seg-btn',
+    'aria-pressed': String(state.mode === 'send'),
+    onclick: () => setMode('send'),
+  }, '扫码发码');
 
-  if (state.mode === 'recv') {
-    mainChildren.push(renderPrewarmSection());
-  }
+  ui.roleRecvBtn = h('button', {
+    type: 'button',
+    class: 'seg-btn',
+    'aria-pressed': String(state.mode === 'recv'),
+    onclick: () => setMode('recv'),
+  }, '收码等待');
 
-  mainChildren.push(h('aside', { class: 'relay-footer-note' },
-    '仅在房间内临时转发扫码链接，服务端仅内存暂存并在过期后自动清除。'));
+  const roleSwitcher = h('div', { class: 'seg mode-switch', role: 'group', 'aria-label': '角色模式' },
+    ui.roleSendBtn,
+    ui.roleRecvBtn);
 
-  root.append(h('div', { class: 'relay-shell' },
-    h('main', { class: 'relay-wrap' }, ...mainChildren)));
+  // 紧凑可折叠房间条（默认单行，减少首屏占用）
+  ui.roomCodeText = h('span', { class: 'room-code' }, state.room);
+  ui.roomQuickCopyBtn = h('button', {
+    type: 'button',
+    class: 'btn small',
+    onclick: async () => {
+      const ok = await copyText(buildShareUrl(state.room, 'recv'));
+      toast(ok ? '已复制室友收码链接' : '复制失败，请手动复制地址栏');
+    },
+  }, icon('copy', 15), '复制链接');
+
+  const toggleChevron = icon('down', 16);
+  toggleChevron.classList.add('room-toggle-icon');
+  ui.roomToggleBtn = h('button', {
+    type: 'button',
+    class: 'btn small tonal',
+    'aria-expanded': 'false',
+    'aria-controls': 'room-drawer',
+    onclick: () => {
+      state.roomBarExpanded = !state.roomBarExpanded;
+      updateRoomBarInPlace();
+      if (state.roomBarExpanded) {
+        ui.roomInput.focus();
+        ui.roomInput.select();
+      }
+    },
+  }, '切换', toggleChevron);
+
+  ui.roomInput = h('input', {
+    class: 'input room-input',
+    value: state.roomDraft,
+    maxlength: 32,
+    placeholder: '3–32 位字母/数字/_/-',
+    'aria-label': '房间口令',
+    oninput: (e) => { state.roomDraft = e.target.value; },
+  });
+
+  const roomForm = h('form', {
+    class: 'room-form',
+    onsubmit: (e) => {
+      e.preventDefault();
+      setRoom(ui.roomInput.value);
+    },
+  },
+    ui.roomInput,
+    h('button', {
+      type: 'button',
+      class: 'icon-btn',
+      title: '随机房间号',
+      'aria-label': '生成随机房间号',
+      onclick: () => setRoom(randomRoomId()),
+    }, icon('shuffle', 18)),
+    h('button', { type: 'submit', class: 'btn small primary' }, '进入'));
+
+  ui.roomDrawer = h('div', { id: 'room-drawer', class: 'room-drawer', hidden: true },
+    roomForm,
+    h('div', { class: 'room-links' },
+      h('button', {
+        type: 'button',
+        class: 'btn small',
+        onclick: async () => {
+          const ok = await copyText(buildShareUrl(state.room, 'recv'));
+          toast(ok ? '已复制室友收码链接' : '复制失败，请手动复制地址栏');
+        },
+      }, icon('copy', 16), '复制收码链接'),
+      h('button', {
+        type: 'button',
+        class: 'btn small',
+        onclick: async () => {
+          const ok = await copyText(buildShareUrl(state.room, 'send'));
+          toast(ok ? '已复制教室发码链接' : '复制失败，请手动复制地址栏');
+        },
+      }, icon('link', 16), '复制发码链接')));
+
+  ui.roomBar = h('section', { class: 'card room-bar', 'aria-label': '房间设置与分享' },
+    h('div', { class: 'room-summary' },
+      h('div', { class: 'room-summary-main' },
+        h('span', { class: 'room-label' }, '房间'),
+        ui.roomCodeText),
+      h('div', { class: 'room-summary-actions' },
+        ui.roomQuickCopyBtn,
+        ui.roomToggleBtn)),
+    ui.roomDrawer);
+
+  ui.mainSlot = h('div', { class: 'relay-main-slot' });
+  ui.prewarmSlot = h('div', { class: 'relay-prewarm-slot' });
+
+  const footer = h('aside', { class: 'relay-footer-note' },
+    '仅在房间内临时转发扫码链接，服务端仅内存暂存并在过期后自动清除。');
+
+  ui.shell = h('div', {
+    class: 'relay-shell',
+    onclick: (e) => {
+      if (!isTapJumpArmed()) return;
+      if (e.target instanceof Element && e.target.closest(NON_TAP_JUMP_SELECTOR)) return;
+      tryExecutePendingRedirect({ fromGesture: true });
+    },
+  },
+    h('main', { class: 'relay-wrap' },
+      topbar,
+      roleSwitcher,
+      ui.roomBar,
+      ui.mainSlot,
+      ui.prewarmSlot,
+      footer));
+
+  root.append(ui.shell);
+  ui.mounted = true;
+  syncShell();
 }
 
-// ---------- 生命周期与定时刷新 ----------
+// ---------- TTL 倒计时（仅在 active && visible 时运行） ----------
+
+function tickTtl() {
+  if (!state.active || !state.item) {
+    syncTtlTimer();
+    return;
+  }
+  const remain = Math.ceil((state.item.expiresAtLocal - Date.now()) / 1000);
+  if (remain <= 0) {
+    const wasRecv = state.mode === 'recv';
+    clearPendingRedirect();
+    state.active = false;
+    state.item = null;
+    state.redirectNotice = false;
+    syncTtlTimer();
+    syncMainSlot();
+    updateStatusChipInPlace();
+    if (wasRecv) {
+      toast('签到码已过期，继续等待新码');
+    }
+    return;
+  }
+  updateTtlInPlace();
+}
+
+function syncTtlTimer() {
+  const shouldRun = state.active && state.visible;
+  if (shouldRun && !state.ttlTimer) {
+    state.ttlTimer = setInterval(tickTtl, 1000);
+  } else if (!shouldRun && state.ttlTimer) {
+    clearInterval(state.ttlTimer);
+    state.ttlTimer = 0;
+  }
+}
+
+// ---------- 生命周期事件注册 ----------
 
 applyTheme(loadTheme());
 if (typeof matchMedia === 'function') {
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(loadTheme()));
 }
 
-setInterval(() => {
-  if (!state.active || !state.item) return;
-  const remain = Math.ceil((state.item.expiresAtLocal - Date.now()) / 1000);
-  if (remain <= 0) {
-    state.active = false;
-    state.item = null;
-    state.redirectNotice = false;
-    render();
-    return;
+window.addEventListener('focus', () => {
+  state.focused = true;
+  if (state.pendingRedirect && state.redirectStatus === 'awaiting-focus') {
+    tryExecutePendingRedirect({ fromGesture: false });
   }
-  const el = document.getElementById('relay-ttl');
-  if (el) el.textContent = `${remain}s 后过期`;
-}, 1000);
-
-function resumeFromBackground() {
-  if (document.visibilityState === 'visible') {
-    state.warmed = loadWarmed();
-    restartPolling();
-  } else if (state.pollAbort) {
-    state.pollAbort.abort();
-    state.pollRunning = false;
-  }
-}
-
-document.addEventListener('visibilitychange', resumeFromBackground);
-window.addEventListener('pageshow', (e) => {
-  if (e.persisted) resumeFromBackground();
-  else render();
 });
 
-render();
-runPollLoop(true);
+window.addEventListener('blur', () => {
+  state.focused = false;
+  if (state.pendingRedirect && state.redirectStatus === 'idle') {
+    state.redirectStatus = 'awaiting-focus';
+    ensureQR(state.pendingRedirect.url);
+    updateTapJumpClass();
+    updateRedirectPromptInPlace();
+    updateRecvQrInPlace();
+    updateStatusChipInPlace();
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  state.visible = document.visibilityState === 'visible';
+  if (!state.visible) {
+    confirmInFlightRedirect();
+    stopPolling();
+    syncTtlTimer();
+    return;
+  }
+
+  state.focused = hasDocumentFocus();
+  state.warmed = loadWarmed();
+  updatePrewarmInPlace();
+  syncTtlTimer();
+  tickTtl();
+  restartPolling();
+
+  if (state.pendingRedirect && (state.redirectStatus === 'awaiting-focus' || state.redirectStatus === 'idle')) {
+    tryExecutePendingRedirect({ fromGesture: false });
+  }
+});
+
+window.addEventListener('pagehide', () => {
+  confirmInFlightRedirect();
+  stopPolling();
+  syncTtlTimer();
+  cleanupScannerInteraction();
+  disposeScannerResources();
+});
+
+window.addEventListener('pageshow', (e) => {
+  clearRedirectWatchdog();
+  state.redirectInFlightKey = null;
+  state.visible = document.visibilityState === 'visible';
+  state.focused = hasDocumentFocus();
+  state.online = typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+
+  if (!e.persisted) return;
+
+  state.warmed = loadWarmed();
+  if (state.pendingRedirect && hasRedirectedKey(state.pendingRedirect.key)) {
+    state.pendingRedirect = null;
+    state.redirectStatus = 'done';
+    state.redirectNotice = true;
+  } else if (state.item && hasRedirectedKey(redirectedKey(state.item))) {
+    state.pendingRedirect = null;
+    state.redirectStatus = 'done';
+    state.redirectNotice = true;
+  }
+  if (state.mode === 'recv' && state.active && state.item) {
+    ensureQR(state.item.url);
+  }
+  syncShell();
+  syncTtlTimer();
+  tickTtl();
+  restartPolling();
+});
+
+window.addEventListener('offline', () => {
+  state.online = false;
+  state.conn = 'offline';
+  stopPolling();
+  updateStatusChipInPlace();
+});
+
+window.addEventListener('online', () => {
+  state.online = true;
+  if (state.visible) {
+    restartPolling();
+  }
+});
+
+// 首次启动：仅挂载一次持久化外壳并启动轮询。
+mountShell();
+if (state.visible && state.online) {
+  restartPolling();
+}

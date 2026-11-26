@@ -2,6 +2,7 @@
 // 样式仅通过 CSS 类控制，满足严格 CSP (style-src 'self')。
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
+const MAX_TOASTS = 2;
 
 export function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -34,6 +35,7 @@ export const clear = (el) => {
 const ICONS = {
   x: 'M6 6l12 12M18 6L6 18',
   right: 'M9 5l7 7-7 7',
+  down: 'M6 9l6 6 6-6',
   edit: 'M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4',
   external: 'M14 4h6v6M20 4l-9 9M18 14v6H4V6h6',
   sparkle: 'M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z',
@@ -47,6 +49,7 @@ const ICONS = {
   trash: 'M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13M10 11v6M14 11v6',
   link: 'M10 13a5 5 0 0 0 7.1 0l2.8-2.8a5 5 0 0 0-7.1-7.1L11.2 4.7M14 11a5 5 0 0 0-7.1 0L4.1 13.8a5 5 0 0 0 7.1 7.1l1.6-1.6',
   check: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 12.5l3 3 5-6',
+  refresh: 'M20 11a8 8 0 1 0 2 5.3M20 4v7h-7',
   more: 'M5 12h.01M12 12h.01M19 12h.01',
 };
 
@@ -69,27 +72,84 @@ export function icon(name, size = 20) {
 }
 
 let toastHost = null;
-export function toast(message, { action, onAction, ms = 4000 } = {}) {
+const activeToasts = [];
+
+function getToastContainer() {
+  const openDialogs = document.querySelectorAll('dialog.sheet[open]');
+  if (openDialogs.length > 0) return openDialogs[openDialogs.length - 1];
+  return document.body;
+}
+
+function ensureToastHost() {
   if (!toastHost) {
-    toastHost = h('div', { class: 'toasts', 'aria-live': 'polite' });
-    document.body.append(toastHost);
+    toastHost = h('div', { class: 'toasts', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'false' });
   }
-  const el = h('div', { class: 'toast' }, h('span', {}, message));
-  let timer;
-  const close = () => { clearTimeout(timer); el.remove(); };
+  const target = getToastContainer();
+  if (target && toastHost.parentNode !== target) {
+    target.append(toastHost);
+  }
+  return toastHost;
+}
+
+// 启动时即挂载 live region，确保读屏软件能播报首条 toast。
+if (typeof document !== 'undefined') {
+  if (document.body) ensureToastHost();
+  else document.addEventListener('DOMContentLoaded', ensureToastHost, { once: true });
+}
+
+export function toast(message, { action, onAction, ms = 4000 } = {}) {
+  const host = ensureToastHost();
+  const text = String(message || '');
+
+  // 去重：若相同内容正在显示，刷新其自动关闭计时器。
+  const dupIdx = activeToasts.findIndex((t) => t.message === text && t.action === (action || ''));
+  if (dupIdx >= 0) {
+    const existing = activeToasts[dupIdx];
+    existing.resetTimer(ms);
+    return existing.close;
+  }
+
+  // 最多同时保留 MAX_TOASTS 条，超出时移除最早的一条。
+  while (activeToasts.length >= MAX_TOASTS) {
+    activeToasts[0].close();
+  }
+
+  const el = h('div', { class: 'toast' }, h('span', {}, text));
+  let timer = 0;
+  let closed = false;
+  const entry = {
+    message: text,
+    action: action || '',
+    close: () => {
+      if (closed) return;
+      closed = true;
+      clearTimeout(timer);
+      el.remove();
+      const idx = activeToasts.indexOf(entry);
+      if (idx >= 0) activeToasts.splice(idx, 1);
+    },
+    resetTimer: (nextMs) => {
+      clearTimeout(timer);
+      timer = setTimeout(entry.close, nextMs);
+    },
+  };
+
   if (action) {
     el.append(h('button', {
       class: 'toast-action',
       type: 'button',
-      onclick: () => { close(); if (onAction) onAction(); },
+      onclick: () => { entry.close(); if (onAction) onAction(); },
     }, action));
   }
-  toastHost.append(el);
-  timer = setTimeout(close, ms);
-  return close;
+
+  host.append(el);
+  activeToasts.push(entry);
+  entry.resetTimer(ms);
+  return entry.close;
 }
 
 export function openDialog(content, { onClose, wide = false, label = '' } = {}) {
+  const prevFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const dlg = h('dialog', { class: `sheet${wide ? ' wide' : ''}`, 'aria-label': label });
   const inner = h('div', { class: 'sheet-body' }, content);
   dlg.append(inner);
@@ -97,12 +157,21 @@ export function openDialog(content, { onClose, wide = false, label = '' } = {}) 
   const finish = () => {
     if (finished) return;
     finished = true;
+    // 若 toastHost 当前挂载在该 dialog 内，先移回 body 或下层 dialog。
+    if (toastHost && toastHost.parentNode === dlg) {
+      document.body.append(toastHost);
+    }
     dlg.remove();
+    ensureToastHost();
+    if (prevFocus && prevFocus.isConnected) {
+      try { prevFocus.focus({ preventScroll: true }); } catch { /* ignore */ }
+    }
     if (onClose) onClose();
   };
   dlg.addEventListener('close', finish);
   dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
   document.body.append(dlg);
   dlg.showModal();
+  ensureToastHost();
   return { el: dlg, close: () => { if (dlg.open) dlg.close(); else finish(); } };
 }
