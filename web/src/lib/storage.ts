@@ -3,7 +3,10 @@ import type { Preset, Role, WarmedMap } from '../types/protocol';
 export const VALID_ROOM_RE = /^[A-Za-z0-9_-]{3,32}$/;
 
 const STORAGE_ROOM = 'class-relay-room';
+const STORAGE_RECENT_ROOMS = 'class-relay-recent-rooms';
 const STORAGE_MODE = 'class-relay-mode';
+const LEGACY_DEFAULT_ROOM = 'dorm402';
+const MAX_RECENT_ROOMS = 5;
 const STORAGE_AUTO = 'class-relay-auto';
 const STORAGE_SOURCE = 'class-relay-source';
 const STORAGE_TTL = 'class-relay-ttl';
@@ -84,6 +87,30 @@ export function getClientId(): string {
   return id;
 }
 
+export function loadRecentRooms(): string[] {
+  const raw = safeReadJSON<unknown>(STORAGE_RECENT_ROOMS, []);
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item === 'string' && VALID_ROOM_RE.test(item) && !out.includes(item)) {
+      out.push(item);
+      if (out.length >= MAX_RECENT_ROOMS) break;
+    }
+  }
+  return out;
+}
+
+export function recordRecentRoom(room: string): string[] {
+  const cleaned = String(room || '').trim();
+  if (!VALID_ROOM_RE.test(cleaned)) return loadRecentRooms();
+  const next = [cleaned, ...loadRecentRooms().filter((r) => r !== cleaned)].slice(
+    0,
+    MAX_RECENT_ROOMS,
+  );
+  safeWriteJSON(STORAGE_RECENT_ROOMS, next);
+  return next;
+}
+
 export function initialRoom(): string {
   if (typeof location !== 'undefined') {
     const qs = new URLSearchParams(location.search);
@@ -94,16 +121,27 @@ export function initialRoom(): string {
       } catch {
         // ignore
       }
+      recordRecentRoom(qRoom);
       return qRoom;
     }
   }
   try {
     const saved = globalThis.localStorage?.getItem(STORAGE_ROOM);
-    if (saved && VALID_ROOM_RE.test(saved)) return saved;
+    if (saved && VALID_ROOM_RE.test(saved) && saved !== LEGACY_DEFAULT_ROOM) {
+      recordRecentRoom(saved);
+      return saved;
+    }
   } catch {
     // ignore
   }
-  return 'dorm402';
+  const generated = randomRoomId();
+  try {
+    globalThis.localStorage?.setItem(STORAGE_ROOM, generated);
+  } catch {
+    // ignore
+  }
+  recordRecentRoom(generated);
+  return generated;
 }
 
 export function initialMode(): Role {
@@ -129,20 +167,23 @@ export function initialMode(): Role {
 }
 
 export function randomRoomId(): string {
-  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-  const buf = new Uint8Array(6);
-  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
-    globalThis.crypto.getRandomValues(buf);
-  } else {
-    for (let i = 0; i < buf.length; i++) {
-      buf[i] = Math.floor(Math.random() * 256);
+  const min = 10000;
+  const span = 90000; // 10000..99999 (5-digit numeric room)
+  for (let attempt = 0; attempt < 8; attempt++) {
+    let val: number;
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
+      const buf = new Uint32Array(1);
+      globalThis.crypto.getRandomValues(buf);
+      val = min + (buf[0] % span);
+    } else {
+      val = min + Math.floor(Math.random() * span);
+    }
+    const str = String(val);
+    if (!/^(\d)\1{4}$/.test(str)) {
+      return str;
     }
   }
-  let out = 'r';
-  for (let i = 0; i < buf.length; i++) {
-    out += chars[buf[i] % chars.length];
-  }
-  return out;
+  return '48293';
 }
 
 export function guessSource(url: string, fallback = '普通链接'): string {

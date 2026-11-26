@@ -133,6 +133,13 @@ a { color: var(--primary); }
   white-space: nowrap;
   border: 0;
 }
+.copy-scratch {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+  opacity: 0;
+  pointer-events: none;
+}
 
 /* ---------- 通用基础组件 ---------- */
 
@@ -199,7 +206,8 @@ a { color: var(--primary); }
   .btn.text:hover:not(:disabled) { background: var(--surface-subtle); color: var(--ink); }
   .icon-btn:hover:not(:disabled) { background: var(--surface-subtle); color: var(--ink); }
   .sync-chip.interactive:hover:not(:disabled) { filter: brightness(.97); }
-  .room-pill-btn:hover { background: var(--surface-hover); }
+  .room-pill-btn:hover,
+  .room-recent-chip:hover { background: var(--surface-hover); color: var(--ink); }
   .disclosure-toggle:hover,
   .prewarm-toggle:hover { background: var(--surface-subtle); }
 }
@@ -454,8 +462,14 @@ dialog.sheet::backdrop { background: var(--scrim); animation: fade .18s; }
   max-width: 240px;
   transition: background .15s var(--ease);
 }
-.room-hash { color: var(--ink-3); font-weight: 700; }
-.room-code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-prefix { font-size: 12px; color: var(--ink-2); font-weight: 500; flex: none; }
+.room-code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: .04em;
+  font-weight: 700;
+}
 .room-toggle-icon { color: var(--ink-2); transition: transform .2s var(--ease); }
 .room-strip-wrap.expanded .room-toggle-icon { transform: rotate(180deg); }
 
@@ -473,9 +487,38 @@ dialog.sheet::backdrop { background: var(--scrim); animation: fade .18s; }
   min-height: 38px;
   padding: 6px 12px;
   font-variant-numeric: tabular-nums;
+  letter-spacing: .04em;
   font-weight: 600;
 }
-.room-links { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.room-recent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.room-recent-label { font-size: 12px; color: var(--ink-3); flex: none; }
+.room-recent-list {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.room-recent-chip {
+  height: 26px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .03em;
+  transition: background .15s var(--ease), color .15s var(--ease);
+}
+.room-links { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.room-links .btn.small { padding: 0 8px; font-size: 12.5px; }
 
 /* ---------- 主卡片 ---------- */
 
@@ -994,7 +1037,6 @@ dialog.sheet::backdrop { background: var(--scrim); animation: fade .18s; }
 
 @media (max-width: 480px) {
   .relay-card { padding: 18px 16px; }
-  .room-links { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {
